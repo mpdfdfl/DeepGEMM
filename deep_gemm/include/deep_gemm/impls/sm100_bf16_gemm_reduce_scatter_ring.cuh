@@ -30,10 +30,20 @@ namespace deep_gemm {
 //     MIDDLE (0<d<R-1): wait upstream flag -> load upstream partial + my own tile -> add
 //                        -> TMA-store to down(i) ring slot[c]
 //     END    (d==0,i==c): wait upstream flag -> load partial + own -> add -> write OUTPUT
-//   Writer: TMA-store -> tma_store_wait -> threadfence_system -> red_add_rel_sys(down flag).
-//   Reader (w3): ld_acq_sys spin on my flag. Deadlock-free: per-tile dep chain START->..->END
-//   is a linear DAG; combined with per-SM in-order execution it stays acyclic (verified by
-//   tests/sim_ring_deadlock.py for R=2/4/8, all M, both schedules).
+//   Writer: TMA-store issued -> NON-.read `cp.async.bulk.wait_group` drains the oldest in-flight
+//           store (full completion, destination visible) -> per-tile `red.release.sys.or` sets
+//           ONE bit in the peer's segment bitmask (the release atomic alone carries the data —
+//           no `__threadfence_system` needed once the wait is non-.read).
+//   Reader (w3): `ld.acquire.sys` polls THAT tile's bit in the segment mask, with a lane-0
+//           word-cache so consecutive tiles in the same uint64 word skip the system-scope load
+//           when their bit is already set. Per-tile granularity means rank i starts reducing
+//           tile 0 as soon as rank i+1 stored tile 0 (no more "wait entire upstream segment").
+//   Deadlock-freedom: WG2 keeps K-1 stores in flight inside one owner segment, and flushes ALL
+//           in-flight stores (firing their ORs) at every owner boundary BEFORE the new segment's
+//           first blocking wait. Every cross-rank wait edge then strictly decreases the segment
+//           slot index — a DAG. Verified by tests/sim_ring_deadlock.py --seg-order --drain-k 2
+//           for R=2/4/8 (and the same sim reproduces the naive no-flush drain-ring deadlock
+//           observed on hardware with --no-boundary-flush).
 //
 // 3 warpgroups (384 threads = 12 warps):
 //   WG0 producer (w0-3, 48 regs): w0 TMA-load A/B; w1 MMA; w2 TMEM alloc; w3 partial TMA-load
@@ -45,9 +55,9 @@ namespace deep_gemm {
 //
 // Symmetric buffer layout (identical on every rank):
 //   [ barrier region (32 B) ]
-//   [ output   : m_per_rank * N * sizeof(bf16) ]            (END writes here, owner==rank)
-//   [ ring recv: kNumRanks * m_per_rank * N * sizeof(bf16) ](upstream writes running-sum here)
-//   [ flags    : num_m_blocks * num_n_blocks * int ]        (per-tile ready flag)
+//   [ output   : m_per_rank * N * sizeof(bf16) ]                                (END writes here, owner==rank)
+//   [ ring recv: kNumRanks * m_per_rank * N * sizeof(bf16) ]                    (upstream writes running-sum here)
+//   [ mask     : kNumRanks * ceil(seg_tiles/64) * uint64_t ]                    (per-tile ready bitmask)
 //
 // swap-AB: token(M) is UMMA N-dim (BLOCK_M, 16..256); hidden(N) is UMMA M-dim (BLOCK_N=128).
 // Owner segments padded to a multiple of BLOCK_M so each tile belongs to exactly one owner.
@@ -100,11 +110,15 @@ sm100_bf16_gemm_reduce_scatter_ring_impl(uint32_t shape_m, uint32_t shape_n, uin
     // Epilogue configs. NO separate epi_smem: WG1 adds the upstream partial IN REGISTERS (non-swap
     // is token-major, so TMEM_LOAD values and the partial share layout) and writes the running-sum
     // straight back into partial_buf; WG2 then just TMA-stores it (pure send). partial_buf is the
-    // ONE staging buffer (2 stages) shared by w3(fill upstream) -> WG1(add own, write sum) ->
-    // WG2(send). Removing epi_smem frees smem for a deeper A/B load pipeline. TMEM kept at 4.
+    // ONE staging buffer shared by w3(fill upstream) -> WG1(add own, write sum) -> WG2(send).
+    // K=2 measured best: it keeps the A/B load pipeline at ns=4 (K=3 drops ns to 3, K=4 to 2 —
+    // both net losses), while WG2's drain-ring still hides one store's NVLink RTT per tile.
     constexpr uint32_t kNumEpilogueStages = 4;   // TMEM accumulator depth (MMA look-ahead)
     constexpr uint32_t kNumPartialStages  = 2;   // partial_buf depth (w3/WG1/WG2 pipeline)
     DG_STATIC_ASSERT(kNumEpilogueStages * UMMA_N <= 512, "TMEM accumulator columns exceed 512");
+    // WG2's drain_oldest cascade enumerates `cp.async.bulk.wait_group` levels 0..3 (compile-time
+    // template arg). Bumping K beyond 4 needs the cascade extended — assert to catch it.
+    DG_STATIC_ASSERT(kNumPartialStages <= 4, "drain_oldest cascade only enumerates waits up to 3");
 
     // Store granularity = WHOLE tile: 128 token rows (== BLOCK_M) x BLOCK_N hidden.
     constexpr uint32_t STORE_BLOCK_M = BLOCK_M;     // 128 token rows
@@ -166,7 +180,7 @@ sm100_bf16_gemm_reduce_scatter_ring_impl(uint32_t shape_m, uint32_t shape_n, uin
         static_cast<uint8_t*>(sym_buffer.get_base_ptr()) + layout::Workspace::kNumBarrierSignalBytes);
     auto* ring_base = reinterpret_cast<nv_bfloat16*>(
         reinterpret_cast<uint8_t*>(out_base) + shard_elems * sizeof(nv_bfloat16));
-    auto* flag_base = reinterpret_cast<int*>(
+    auto* mask_base = reinterpret_cast<uint64_t*>(
         reinterpret_cast<uint8_t*>(ring_base) + kNumRanks * shard_elems * sizeof(nv_bfloat16));
 
     // Ring neighbour: where I STORE my running-sum.
@@ -190,7 +204,7 @@ sm100_bf16_gemm_reduce_scatter_ring_impl(uint32_t shape_m, uint32_t shape_n, uin
     // Barriers region. partial_buf is a 3-stage-of-life pipeline on ONE buffer:
     //   part_full : w3 filled upstream  -> WG1        (init 1  : one TMA producer)
     //   epi_full  : WG1 wrote running-sum -> WG2      (init 128: all WG1 threads)
-    //   part_empty: WG2 sent it -> w3 (refill)        (init 128: all WG2 threads)
+    //   part_empty: WG2 sent it -> w3 (refill)        (init 1  : only WG2 warp 0 lane 0 arrives)
     // Each group has kNumPartialStages entries.
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(
         smem_buffer + SMEM_PARTIAL_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE));
@@ -222,7 +236,7 @@ sm100_bf16_gemm_reduce_scatter_ring_impl(uint32_t shape_m, uint32_t shape_n, uin
         for (uint32_t i = 0; i < kNumPartialStages; ++ i) {
             part_full_barriers[i]->init(1);                      // w3 (one thread) signals partial loaded
             epi_full_barriers[i]->init(kNumEpilogueThreads);     // all WG1 threads signal running-sum ready
-            part_empty_barriers[i]->init(kNumRingThreads);       // all WG2 threads release partial
+            part_empty_barriers[i]->init(1);                     // only WG2 warp 0 lane 0 releases partial
         }
         cutlass::arch::fence_barrier_init();
     } else if (warp_idx == 2) {
@@ -232,21 +246,27 @@ sm100_bf16_gemm_reduce_scatter_ring_impl(uint32_t shape_m, uint32_t shape_n, uin
 
     cudaGridDependencySynchronize();
 
-    // ================= reset PER-OWNER-SEGMENT flags + counters + cross-rank barrier =================
-    // Coarse per-segment flag protocol (flux-style): instead of a flag per tile (hundreds of
-    // system fences), there is ONE flag per owner c (R total). Upstream (i+1) sets rank i's
-    // flag[c] exactly ONCE, after storing ALL of segment c's tiles; rank i (w3) waits it ONCE.
-    // A device-scope counter[c] (rank-local) counts how many of segment c's tiles THIS rank has
-    // stored; the SM that bumps it to seg_tiles does the single threadfence_system + release flag.
-    //   flag region layout: [ flags: R int ][ counters: R int ]
+    // ================= reset PER-TILE bitmask + cross-rank barrier =================
+    // Per-tile bitmask protocol (replaces per-segment flag): each tile owns ONE bit in a
+    // uint64_t word within its segment's mask region. Upstream (WG2 on rank i+1) issues ONE
+    // `red.release.sys.or` per drained tile (piggy-backed on the NON-.read
+    // `cp.async.bulk.wait_group` drain of the K-slot in-flight ring), setting that tile's bit
+    // in rank i's mask. Downstream (rank i, w3) polls ONLY that tile's bit with
+    // `ld.acquire.sys` — per-tile granularity, no more "wait entire upstream segment".
+    // No `__threadfence_system` is needed: the non-.read wait completes the bulk async op
+    // (destination visible to the generic proxy), and the release atomic publishes everything
+    // visible to this thread at system scope.
+    //   mask region layout: [ kNumRanks segments ][ kWordsPerSeg uint64_t per segment ]
     const uint32_t num_m_blocks = shape_m / BLOCK_M;                    // owner-aligned padded M
     const uint32_t num_n_blocks = shape_n / BLOCK_N;
-    auto* counter_base = flag_base + kNumRanks;                        // R flags, then R counters
-    const uint32_t bpo = m_per_rank / BLOCK_M;                         // blocks per owner (exact)
-    const uint32_t seg_tiles = bpo * num_n_blocks;                     // tiles per owner segment
-    const uint32_t total_tiles = num_m_blocks * num_n_blocks;          // = R * seg_tiles
-    if (sm_idx == 0 and thread_idx < 2 * kNumRanks)
-        flag_base[thread_idx] = 0;                                     // zero R flags + R counters
+    const uint32_t bpo = m_per_rank / BLOCK_M;                          // blocks per owner (exact)
+    const uint32_t seg_tiles = bpo * num_n_blocks;                      // tiles per owner segment
+    const uint32_t words_per_seg = math::ceil_div(seg_tiles, 64u);      // uint64_t words per segment mask
+    const uint32_t total_mask_words = kNumRanks * words_per_seg;        // total u64 words in the mask
+    if (sm_idx == 0) {
+        for (uint32_t i = thread_idx; i < total_mask_words; i += 384)
+            mask_base[i] = 0ull;
+    }
     comm::grid_sync<kNumSMs, /*kGridSyncIndex=*/1>(workspace, sm_idx, thread_idx, [&]() { __syncthreads(); });
     comm::nvlink_barrier<kNumRanks, kNumSMs, 384, /*kGridSyncIndex=*/2, /*kTag=*/0>(
         workspace, sym_buffer, sm_idx, thread_idx, [&]() { __syncthreads(); });
@@ -267,9 +287,11 @@ sm100_bf16_gemm_reduce_scatter_ring_impl(uint32_t shape_m, uint32_t shape_n, uin
     // SEGMENT-ORDERED tile enumeration (replaces the L2-swizzle scheduler order). All 5 roles
     // iterate the SAME sequence: for staggered owner segment t=0..R-1 (c=(rank+1+t)%R), the
     // segment's (off,nb) tiles are handed grid-strided to SMs; a whole segment is enumerated
-    // before the next. This makes the per-segment flag deadlock-free (verified by
-    // tests/sim_ring_deadlock.py --seg-flag --seg-order for R=2/4/8, all M). Whole segment c
-    // lives at m_block [c*bpo, c*bpo+bpo); BLOCK_M=128 padding keeps every tile single-owner.
+    // before the next. Deadlock-free under per-tile bitmask signaling — the per-tile DAG is
+    // strictly finer than the previous per-segment DAG (still linear START->..->END per tile).
+    // Whole segment c lives at m_block [c*bpo, c*bpo+bpo); BLOCK_M=128 padding keeps every tile
+    // single-owner.
+    const uint32_t total_tiles = num_m_blocks * num_n_blocks;          // = R * seg_tiles
     auto seg_tile = [&](const uint32_t& it, uint32_t& mb, uint32_t& nb_out, uint32_t& owner) -> bool {
         const uint64_t gbi = static_cast<uint64_t>(it) * kNumSMs + sm_idx;
         if (gbi >= total_tiles) return false;
@@ -372,30 +394,48 @@ sm100_bf16_gemm_reduce_scatter_ring_impl(uint32_t shape_m, uint32_t shape_n, uin
             }
         } else if (warp_idx == 3) {
             // ---- w3: partial TMA-load. EVERY tile cycles the partial_buf stage (so w3/WG1/WG2
-            //          barrier counts stay consistent). Per SEGMENT wait the ONE upstream flag once
-            //          (MIDDLE/END). For a non-START tile TMA-load the upstream partial into
-            //          partial_buf; for a START tile just arrive part_full with 0 bytes (WG1 will
-            //          write the own tile with no add). ----
+            //          barrier counts stay consistent). Per-TILE bit query on the segment mask
+            //          (MIDDLE/END): ld.acquire.sys on THIS tile's bit lets rank i start reducing
+            //          tile 0 as soon as rank i+1 stored tile 0 (no wait-entire-segment). For a
+            //          START tile just arrive part_full with 0 bytes (WG1 will write the own tile
+            //          with no add).
+            //          WORD-CACHE: consecutive tiles share one uint64 mask word (64 consecutive
+            //          bits). Lane 0 caches the last-read word; if the next tile's bit is already
+            //          set in the cached value, the wait is free (no system-scope load). The
+            //          acquire ordering from the load that read the word covers every bit set in
+            //          it, so reusing the cached value is safe. ----
             uint32_t part_stage_idx = 0, part_phase = 0;
             int cur_owner = -1;
             bool cur_is_start = false;
+            const uint64_t* pend_ptr = nullptr;   // lane-0-only mask word cache
+            uint64_t pend_word = 0;
             uint32_t seg_owner;
             for (uint32_t it = 0; seg_tile(it, m_block_idx, n_block_idx, seg_owner); ++ it) {
                 const uint32_t base_m_idx = m_block_idx * BLOCK_M;
                 const uint32_t base_n_idx = n_block_idx * BLOCK_N;
                 const uint32_t owner = seg_owner;
-                const uint32_t d = (rank - owner + kNumRanks) % kNumRanks;
                 if (static_cast<int>(owner) != cur_owner) {
                     cur_owner = static_cast<int>(owner);
+                    const uint32_t d = (rank - owner + kNumRanks) % kNumRanks;
                     cur_is_start = (d == kNumRanks - 1);
-#ifndef DG_RS_W3_NOLOAD
-                    if (not cur_is_start) {
-                        if (lane_idx == 0)
-                            while (ptx::ld_acq_sys(flag_base + owner) == 0) {}   // per-segment flag
-                        __syncwarp();
-                    }
-#endif
                 }
+#ifndef DG_RS_W3_NOLOAD
+                if (not cur_is_start) {
+                    // Per-tile bit-wait on THIS tile's slot in the segment mask.
+                    const uint32_t m_local_block = m_block_idx - owner * bpo;
+                    const uint32_t bit          = m_local_block * num_n_blocks + n_block_idx;
+                    const uint64_t bit_mask     = 1ull << (bit % 64);
+                    const uint64_t* word_ptr    = mask_base + owner * words_per_seg + bit / 64;
+                    if (lane_idx == 0) {
+                        uint64_t w = (word_ptr == pend_ptr) ? pend_word : 0ull;
+                        while ((w & bit_mask) == 0)
+                            w = ptx::ld_acq_sys(word_ptr);
+                        pend_word = w;
+                        pend_ptr  = word_ptr;
+                    }
+                    __syncwarp();
+                }
+#endif
                 part_empty_barriers[part_stage_idx]->wait(part_phase ^ 1);
                 if (cute::elect_one_sync()) {
 #ifdef DG_RS_W3_NOLOAD
@@ -513,70 +553,134 @@ sm100_bf16_gemm_reduce_scatter_ring_impl(uint32_t shape_m, uint32_t shape_n, uin
     // ============================================================================
     // WG2 ring (warps 8-11): PURE SEND. WG1 already wrote the running-sum (own+upstream) into
     // partial_buf, so WG2 just TMA-stores it to the down peer ring slot (or own output for END),
-    // drains, releases partial_buf back to w3, and counts toward the per-segment flag.
+    // then per-tile `red.release.sys.or` sets THIS tile's bit in the peer's segment mask.
+    //
+    // Drain-ring + OWNER-BOUNDARY FLUSH: within one owner segment, warp 0 keeps K-1 TMA stores
+    // in flight and drains the oldest via `tma_store_wait<K-1>` (per-tile OR + part_empty fire
+    // on the DRAINED tile), hiding NVLink RTT off the critical path. At an owner change — BEFORE
+    // the first epi_full wait of the new segment — all in-flight stores are fully drained and
+    // their ORs fired. The flush is what makes this deadlock-free: every cross-rank dependency
+    // (rank i waiting rank i+1's OR for owner c) is satisfied by the time rank i+1 leaves its
+    // owner-c segment, and staggered enumeration gives owner c a strictly smaller segment slot
+    // on rank i+1 than on rank i, so every wait edge strictly decreases the segment index — a
+    // DAG. (The naive drain-ring without the boundary flush deadlocks: the last K-1 ORs of a
+    // segment would only fire in the trailing drain after the main loop, but the main loop can
+    // block on an upstream OR whose owner sits exactly K-1 tiles from ITS segment end — a cycle
+    // around the ring.)
     // ============================================================================
     } else {
         cutlass::arch::warpgroup_reg_alloc<kNumRingRegisters>();
         const uint32_t ring_warp_idx = warp_idx - 8;
 
         constexpr uint32_t STORE_BLOCK_N_ATOM = kSwizzleCDMode / sizeof(cd_dtype_t);
-        uint32_t part_stage_idx = 0, part_phase = 0;
+        // Only WG2 warp 0 drives the tile loop; warps 1-3 skip to the kernel's final barrier
+        // (part_empty init=1, no NamedBarrier, no per-tile 128-thread sync).
+        if (ring_warp_idx == 0) {
+            uint32_t part_stage_idx = 0, part_phase = 0;
+            int cur_owner = -1;
+            bool cur_is_end = false;
 
-        // Per-SEGMENT flag: each stored tile bumps a device-scope counter[c]; the SM that makes
-        // counter[c] reach seg_tiles does ONE __threadfence_system + release the downstream flag[c].
-        // (deadlock-free under segment-ordered enumeration; sim_ring_deadlock --seg-flag --seg-order.)
-        int cur_owner = -1;
-        bool cur_is_end = false;
-        uint32_t seg_local_cnt = 0;
-        auto flush_segment = [&](uint32_t c, bool is_end) {
-            cutlass::arch::NamedBarrier::sync(kNumRingThreads, 3);
-            if (not is_end and ring_warp_idx == 0 and cute::elect_one_sync() and seg_local_cnt > 0) {
-                __threadfence_system();
-                int prev = atomicAdd(counter_base + c, static_cast<int>(seg_local_cnt));
-                if (prev + static_cast<int>(seg_local_cnt) == static_cast<int>(seg_tiles))
-                    ptx::red_add_rel_sys(sym_buffer.map(flag_base + c, down), 1);
-            }
-            seg_local_cnt = 0;
-        };
+            // In-flight ring: up to K = kNumPartialStages TMA stores pending at any time.
+            // Only lane 0 issues TMA stores / waits / arrives (TMA commit+wait are per-thread).
+            uint32_t inflight_stage[kNumPartialStages] = {};
+            uint32_t inflight_owner[kNumPartialStages] = {};
+            uint32_t inflight_bit  [kNumPartialStages] = {};
+            bool     inflight_end  [kNumPartialStages] = {};
+            uint32_t head = 0, count = 0;
 
-        uint32_t seg_owner;
-        for (uint32_t it = 0; seg_tile(it, m_block_idx, n_block_idx, seg_owner); ++ it) {
-            const uint32_t base_n_idx = n_block_idx * BLOCK_N;
-            const uint32_t owner = seg_owner;
-            const uint32_t m_local = m_block_idx * BLOCK_M - owner * m_per_rank;
-            const uint32_t d = (rank - owner + kNumRanks) % kNumRanks;
-            if (static_cast<int>(owner) != cur_owner) {
-                if (cur_owner >= 0)
-                    flush_segment(static_cast<uint32_t>(cur_owner), cur_is_end);
-                cur_owner = static_cast<int>(owner);
-                cur_is_end = (d == 0);
-            }
-            const bool is_end = cur_is_end;
-
-            // Wait WG1 to have written the running-sum into partial_buf[part_stage_idx].
-            epi_full_barriers[part_stage_idx]->wait(part_phase);
-            // Issue + drain the whole-[128,128] store (down peer ring slot, or own output for END).
-            if (ring_warp_idx == 0 and cute::elect_one_sync()) {
-                const auto& tmap = is_end ? tensor_map_out : tensor_map_ring_store_down;
-                const uint32_t row = is_end ? m_local : (owner * m_per_rank + m_local);
-                #pragma unroll
-                for (uint32_t i = 0; i < STORE_BLOCK_N / STORE_BLOCK_N_ATOM; ++ i) {
-                    auto smem_ptr = smem_partial[part_stage_idx] + i * STORE_BLOCK_M * STORE_BLOCK_N_ATOM;
-                    cute::SM90_TMA_STORE_2D::copy(&tmap, smem_ptr, base_n_idx + i * STORE_BLOCK_N_ATOM, row);
+            // Fire the per-tile OR for a drained store and release its partial_buf stage.
+            // No `__threadfence_system`: the drain uses NON-.read `cp.async.bulk.wait_group`,
+            // which completes the bulk async op (destination write visible to the generic
+            // proxy); the `red.release.sys.or` then publishes everything visible to this thread
+            // at system scope, and the peer's `ld.acquire.sys` pairs with it. The fence was
+            // redundant — and cost ~1 us per tile on the critical path.
+            auto fire_or_and_release = [&](const uint32_t& slot) {
+                const uint32_t d_stage = inflight_stage[slot];
+                const uint32_t d_owner = inflight_owner[slot];
+                const uint32_t d_bit   = inflight_bit  [slot];
+                const bool     d_end   = inflight_end  [slot];
+                if (not d_end) {
+                    ptx::red_or_rel_sys(
+                        sym_buffer.map(mask_base + d_owner * words_per_seg + d_bit / 64, down),
+                        1ull << (d_bit % 64));
                 }
-                cute::tma_store_arrive();
-                cute::tma_store_wait<0>();     // store done before releasing partial_buf
+                part_empty_barriers[d_stage]->arrive();
+            };
+
+            // Drain the OLDEST in-flight store, allowing `pending_after` newer ones to stay
+            // pending. Uses NON-.read `cp.async.bulk.wait_group` (full completion, destination
+            // visible) so the release atomic alone suffices for cross-rank ordering.
+            // `wait_group` needs a compile-time N — cascade over the possible values.
+            auto drain_oldest = [&](const uint32_t& pending_after) {
+                if (pending_after >= 3)      asm volatile("cp.async.bulk.wait_group 3;" ::: "memory");
+                else if (pending_after == 2) asm volatile("cp.async.bulk.wait_group 2;" ::: "memory");
+                else if (pending_after == 1) asm volatile("cp.async.bulk.wait_group 1;" ::: "memory");
+                else                         asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+                fire_or_and_release(head);
+                head = (head + 1) % kNumPartialStages;
+                -- count;
+            };
+
+            uint32_t seg_owner;
+            for (uint32_t it = 0; seg_tile(it, m_block_idx, n_block_idx, seg_owner); ++ it) {
+                const uint32_t base_n_idx = n_block_idx * BLOCK_N;
+                const uint32_t owner = seg_owner;
+                const uint32_t m_local = m_block_idx * BLOCK_M - owner * m_per_rank;
+                if (static_cast<int>(owner) != cur_owner) {
+                    // OWNER BOUNDARY: flush ALL in-flight stores (fire their ORs) BEFORE any
+                    // blocking wait for the new segment — see header comment for the DAG argument.
+                    if (lane_idx == 0) {
+                        while (count > 0)
+                            drain_oldest(count - 1);
+                    }
+                    __syncwarp();
+                    cur_owner = static_cast<int>(owner);
+                    const uint32_t d = (rank - owner + kNumRanks) % kNumRanks;
+                    cur_is_end = (d == 0);
+                }
+                const bool is_end = cur_is_end;
+                const uint32_t m_local_block = m_block_idx - owner * bpo;
+                const uint32_t tile_bit = m_local_block * num_n_blocks + n_block_idx;
+
+                // Wait WG1 to have written the running-sum into partial_buf[part_stage_idx].
+                epi_full_barriers[part_stage_idx]->wait(part_phase);
+
+                if (lane_idx == 0) {
+                    // Issue THIS tile's whole-[128,128] TMA store. Async — drained K-1 tiles later.
+                    const auto& tmap = is_end ? tensor_map_out : tensor_map_ring_store_down;
+                    const uint32_t row = is_end ? m_local : (owner * m_per_rank + m_local);
+                    #pragma unroll
+                    for (uint32_t i = 0; i < STORE_BLOCK_N / STORE_BLOCK_N_ATOM; ++ i) {
+                        auto smem_ptr = smem_partial[part_stage_idx] + i * STORE_BLOCK_M * STORE_BLOCK_N_ATOM;
+                        cute::SM90_TMA_STORE_2D::copy(&tmap, smem_ptr, base_n_idx + i * STORE_BLOCK_N_ATOM, row);
+                    }
+                    cute::tma_store_arrive();
+
+                    // Record for later drain.
+                    const uint32_t slot = (head + count) % kNumPartialStages;
+                    inflight_stage[slot] = part_stage_idx;
+                    inflight_owner[slot] = owner;
+                    inflight_bit  [slot] = tile_bit;
+                    inflight_end  [slot] = is_end;
+                    ++ count;
+
+                    // Ring full → drain the oldest (its store is complete; OR + release fire now).
+                    if (count == kNumPartialStages)
+                        drain_oldest(kNumPartialStages - 1);
+                }
+                __syncwarp();
+
+                part_stage_idx = (part_stage_idx + 1) % kNumPartialStages;
+                part_phase ^= part_stage_idx == 0;
             }
-            // Release partial_buf back to w3; count this stored tile toward the segment.
-            cutlass::arch::NamedBarrier::sync(kNumRingThreads, 2);
-            part_empty_barriers[part_stage_idx]->arrive();
-            ++ seg_local_cnt;
-            part_stage_idx = (part_stage_idx + 1) % kNumPartialStages;
-            part_phase ^= part_stage_idx == 0;
+
+            // Trailing drain: last segment's tail (≤ K-1 stores still in flight).
+            if (lane_idx == 0) {
+                while (count > 0)
+                    drain_oldest(count - 1);
+            }
+            __syncwarp();
         }
-        // Flush the last segment (flag).
-        if (cur_owner >= 0)
-            flush_segment(static_cast<uint32_t>(cur_owner), cur_is_end);
     }
 
     // ================= epilogue: free TMEM, final cross-rank barrier =================

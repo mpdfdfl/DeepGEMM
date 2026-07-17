@@ -353,13 +353,16 @@ class ReduceScatterRingFusedBuffer:
 
     Layout (single symmetric allocation, shared across ranks over NVLink):
         [ barrier region (32 B) ]
-        [ output   : m_per_rank_pad x n  bf16 ]                 (END writes here)
-        [ ring recv: num_ranks x m_per_rank_pad x n  bf16 ]     (upstream running-sum, per owner)
-        [ flags    : num_m_blocks x num_n_blocks  int32 ]       (per-tile ready flag)
+        [ output   : m_per_rank_pad x n  bf16 ]                     (END writes here)
+        [ ring recv: num_ranks x m_per_rank_pad x n  bf16 ]         (upstream running-sum, per owner)
+        [ mask     : num_ranks x ceil(seg_tiles/64) x uint64_t ]    (per-tile ready bitmask)
 
     swap-AB padding mirrors `ReduceScatterBuffer`: token(M) is the UMMA N-dim tiled by
     BLOCK_M=`rs_block_m(m_per_rank)`; each owner segment is padded to a multiple of BLOCK_M so
     every tile is single-owner. `num_m_blocks = m_pad / BLOCK_M`, `num_n_blocks = n / 128`.
+    `seg_tiles = num_m_blocks / num_ranks * num_n_blocks` — each tile owns one bit in its
+    segment's uint64_t bitmask; upstream (WG2 on rank i+1) sets bits per-tile via
+    `red.release.sys.or`, downstream (rank i, w3) polls with `ld.acquire.sys`.
     """
 
     BARRIER_BYTES = 32
@@ -383,9 +386,13 @@ class ReduceScatterRingFusedBuffer:
         shard_elems = self.m_per_rank_pad * n
         self._out_bytes = shard_elems * torch.bfloat16.itemsize
         ring_bytes = self.world_size * shard_elems * torch.bfloat16.itemsize
-        # Per-OWNER-SEGMENT flag protocol: R flags + R device-scope counters (int32 each).
-        flag_bytes = 2 * self.world_size * 4
-        num_bytes = self.BARRIER_BYTES + self._out_bytes + ring_bytes + flag_bytes
+        # Per-TILE bitmask protocol: one bit per tile in the owner segment, uint64_t words.
+        # Kernel does `red.release.sys.or` per-tile; downstream polls `ld.acquire.sys`.
+        bpo = self.m_per_rank_pad // self.block_m                       # blocks per owner
+        seg_tiles = bpo * self.num_n_blocks                             # tiles per owner segment
+        words_per_seg = (seg_tiles + 63) // 64
+        mask_bytes = self.world_size * words_per_seg * 8                # uint64_t per word
+        num_bytes = self.BARRIER_BYTES + self._out_bytes + ring_bytes + mask_bytes
 
         self.buffer = symm_mem.empty(num_bytes, dtype=torch.int8, device='cuda')
         self.handle = symm_mem.rendezvous(self.buffer, group=group)
@@ -404,7 +411,7 @@ class ReduceScatterRingFusedBuffer:
         return padded[:self.m_per_rank]
 
     def zero_(self):
-        # Ring + flags must be cleared every call (the kernel also self-resets flags at entry,
+        # Ring + mask must be cleared every call (the kernel also self-resets the mask at entry,
         # but a full zero keeps the ring recv region clean for repeated launches).
         self.buffer.zero_()
         self.group.barrier()

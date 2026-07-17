@@ -90,7 +90,8 @@ static void __instantiate_kernel() {{
 //
 // `out_sym_buffer` symmetric layout (identical on every rank):
 //   [ barrier (32 B) ][ BF16 output: m_per_rank*n ][ BF16 ring recv: R * m_per_rank * n ]
-//   [ int flags: num_m_blocks * num_n_blocks ]
+//   [ mask: R * ceil(seg_tiles/64) * uint64_t ]  (per-tile ready bitmask; R = num_ranks,
+//                                                  seg_tiles = (m_per_rank/BLOCK_M)*(n/BLOCK_N))
 // `sym_buffer_ptrs`: all peers' base pointers into that symmetric allocation.
 static void sm100_bf16_gemm_reduce_scatter_ring(const torch::Tensor& a,
                                                 const torch::Tensor& b,
@@ -126,7 +127,7 @@ static void sm100_bf16_gemm_reduce_scatter_ring(const torch::Tensor& a,
 
     // Single-CTA NON-swap layout: token(M)=UMMA_M=128, hidden(N)=UMMA_N=BLOCK_N=128. BLOCK_M LOCKED
     // to 128 (owner-aligned token tile; m_per_rank padded to 128 by the wrapper). Standard (non-
-    // transposed) epilogue -> no STSM_T. Whole [128,128] tile per store + one segment flag.
+    // transposed) epilogue -> no STSM_T. Whole [128,128] tile per store + per-tile bitmask signaling.
     const int chosen_block_m = 128;
     const auto all_candidates = SM100ArchSpec::get_layout_candidates(desc);
     std::vector<Layout> candidates;
@@ -165,8 +166,12 @@ static void sm100_bf16_gemm_reduce_scatter_ring(const torch::Tensor& a,
     //   [ partial_buf (part_stages of [128,128]) ][ A: ns ][ B: ns ]
     //   [ barriers: (2*ns + tmem*2 + part*3)*8 ][ tmem_ptr: 4 ].   NO epi_smem.
     // Stage counts — MUST match the kernel (.cuh): kNumEpilogueStages=4 (TMEM), kNumPartialStages=2.
-    // WG1 adds upstream in-registers and writes the running-sum into partial_buf; partial_buf has 3
-    // barrier groups (part_full w3->WG1, epi_full WG1->WG2, part_empty WG2->w3).
+    // part_stages=2 measured best: it keeps the A/B pipeline at ns=4 (part_stages=3 drops ns to
+    // 3, part_stages=4 to 2 — both net losses on bench), while WG2's drain-ring still hides one
+    // store's NVLink RTT per tile.
+    // NOTE: this value is compiled INTO _C.so — after changing it you MUST rebuild the extension
+    // (`touch csrc/python_api.cpp && python setup.py build_ext --inplace`), otherwise the JIT
+    // allocates smem for the OLD stage count while the kernel uses the NEW layout → IMA.
     const int tmem_stages = 4;
     const int part_stages = 2;
     {

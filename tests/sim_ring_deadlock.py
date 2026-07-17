@@ -95,7 +95,7 @@ def ring_state(rank, c, R):
 
 
 def detect_deadlock(R, num_sms, M, N, block_n=128, stagger=True, verbose=False,
-                    seg_flag=False, seg_order=False):
+                    seg_flag=False, seg_order=False, drain_k=1, no_boundary_flush=False):
     m_per_rank = M // R
     block_m = min(128, m_per_rank) if (seg_flag or seg_order) else min(256, m_per_rank)  # fused ring locks 128
     assert m_per_rank % block_m == 0, (m_per_rank, block_m)
@@ -137,6 +137,17 @@ def detect_deadlock(R, num_sms, M, N, block_n=128, stagger=True, verbose=False,
                     if key not in seg_last or p > seg_last[key][0]:
                         seg_last[key] = (p, tile)
 
+    # For drain-ring mode (drain_k > 1): the OR for tile X fires when the SAME upstream SM has
+    # issued K-1 further stores within X's segment (drain-when-full), or at the owner-boundary
+    # flush after the last tile of X's segment in that SM's queue, whichever comes first.
+    # Precompute, per (rank, sm, owner), the last queue position of that owner's tiles.
+    seg_last_pos = {}   # (rank, sm, owner) -> last pos in that SM's queue
+    if drain_k > 1:
+        for i in range(R):
+            for s in range(num_sms):
+                for p, tile in enumerate(all_q[i][s]):
+                    seg_last_pos[(i, s, tile[0])] = p
+
     def deps(node):
         i, tile = node
         c, off, nb = tile
@@ -155,6 +166,17 @@ def detect_deadlock(R, num_sms, M, N, block_n=128, stagger=True, verbose=False,
                 # i.e. depends on upstream's LAST owner-c tile (which itself depends, via edge A,
                 # on every earlier upstream owner-c tile).
                 out.append((up, seg_last[(up, c)][1]))
+            elif drain_k > 1:
+                # DRAIN-RING: OR for tile X fires after upstream's SM processes the tile at
+                # min(pos_X + K-1, DRAIN_HORIZON). With the owner-boundary flush (default),
+                # DRAIN_HORIZON = last pos of X's segment in that SM's queue. With
+                # --no-boundary-flush, DRAIN_HORIZON = end of the whole queue (ORs for the
+                # last K-1 tiles of a segment only fire in the trailing drain after the main
+                # loop — the scheme that deadlocked on hardware at M=1024/2048/4096, R=4).
+                us, up_pos = pos_of[(up, tile)]
+                horizon = len(all_q[up][us]) - 1 if no_boundary_flush else seg_last_pos[(up, us, c)]
+                drain_pos = min(up_pos + drain_k - 1, horizon)
+                out.append((up, all_q[up][us][drain_pos]))
             else:
                 out.append((up, tile))   # per-tile flag
         return out
@@ -215,16 +237,23 @@ if __name__ == "__main__":
     p.add_argument("--n", type=int, default=4096)
     p.add_argument("--seg-flag", action="store_true", help="model per-owner-segment flag deps (BLOCK_M=128)")
     p.add_argument("--seg-order", action="store_true", help="segment-ordered processing (contiguous per owner)")
+    p.add_argument("--drain-k", type=int, default=1,
+                   help="drain-ring depth K: OR for tile X fires K-1 tiles later in-segment, "
+                        "or at the owner-boundary flush (models the WG2 drain-ring; K=1 = fire in-iteration)")
+    p.add_argument("--no-boundary-flush", action="store_true",
+                   help="naive drain-ring: ORs for a segment's last K-1 tiles only fire in the "
+                        "trailing drain after the main loop (expected to deadlock — sanity check)")
     args = p.parse_args()
 
     any_dead = False
     for stagger in (True, False):
-        print(f"\n===== stagger={stagger} seg_flag={args.seg_flag} seg_order={args.seg_order} | R={args.ranks} SMs={args.sms} n={args.n} =====")
+        print(f"\n===== stagger={stagger} seg_flag={args.seg_flag} seg_order={args.seg_order} drain_k={args.drain_k} no_boundary_flush={args.no_boundary_flush} | R={args.ranks} SMs={args.sms} n={args.n} =====")
         for m in (int(x) for x in args.tokens.split(",")):
             if (m // args.ranks) == 0:
                 continue
             r = detect_deadlock(args.ranks, args.sms, m, args.n, stagger=stagger,
-                                seg_flag=args.seg_flag, seg_order=args.seg_order)
+                                seg_flag=args.seg_flag, seg_order=args.seg_order,
+                                drain_k=args.drain_k, no_boundary_flush=args.no_boundary_flush)
             tag = "DEADLOCK" if r["deadlock"] else "ok"
             extra = ""
             if r["deadlock"]:
