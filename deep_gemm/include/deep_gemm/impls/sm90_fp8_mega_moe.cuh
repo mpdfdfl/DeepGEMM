@@ -799,12 +799,20 @@ sm90_fp8_mega_moe_impl(void* y,
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             prev_was_l2 = block_phase == sched::BlockPhase::Linear2;
 
-            // Pingpong: L2 tiles alternate owners by tile parity; the non-owner
-            // fast-forwards its pipeline state without waiting full or arriving empty
+            // Pingpong: L2 tiles alternate owners by tile parity. The non-owner still
+            // participates in every stage's full/empty protocol (wait + arrive, no
+            // compute): a pure local fast-forward can run 2+ ring wraps ahead of the
+            // physical mbarrier, and parity waits alias every 2 completions — observed
+            // as a hang from the second L2 tile on an SM. Participation keeps the
+            // empty-barrier release at 8 warp-arrivals and restores the invariant that
+            // a waiter took part in the stage's previous use
             if (kL2Pingpong and block_phase == sched::BlockPhase::Linear2 and
                 (pos & 1u) != epilogue_wg_idx) {
-                for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx))
-                    ;
+                for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                    full_barriers[stage_idx]->wait(phase);
+                    if (lane_idx == 0)
+                        empty_barriers[stage_idx]->arrive();
+                }
                 ++pos;
                 continue;
             }
@@ -936,14 +944,8 @@ sm90_fp8_mega_moe_impl(void* y,
                         ptx::warpgroup_fence_operand(accum[i]);
                     ptx::warpgroup_wait<0>();
 
-                    if (lane_idx == 0) {
-                        // Pingpong: only the owner WG's 4 warps release the stage, so each
-                        // arrives with count 2 to keep the empty-barrier init count of 8
-                        if constexpr (kL2Pingpong)
-                            ptx::mbarrier_arrive(empty_barriers[stage_idx], 2u);
-                        else
-                            empty_barriers[stage_idx]->arrive();
-                    }
+                    if (lane_idx == 0)
+                        empty_barriers[stage_idx]->arrive();
 
                     // Prefetch the next k-block's weight SF
                     const float cur_l2_sf = l2_sf;

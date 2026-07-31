@@ -38,12 +38,6 @@ CUTLASS_DEVICE void mbarrier_arrive(
                  "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))));
 }
 
-CUTLASS_DEVICE void mbarrier_arrive(
-    cutlass::arch::ClusterTransactionBarrier* ptr, const uint32_t& count) {
-    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0], %1; \n\t" ::
-                 "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))), "r"(count));
-}
-
 CUTLASS_DEVICE void mbarrier_arrive_and_set_tx(
     cutlass::arch::ClusterTransactionBarrier* ptr, const uint32_t& num_bytes) {
     asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%1], %0; \n\t" ::

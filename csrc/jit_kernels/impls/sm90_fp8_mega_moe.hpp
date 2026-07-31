@@ -57,9 +57,10 @@ public:
 
     static std::string generate_impl(const Args& args) {
         return fmt::format(R"(
-// JIT cache key: sm90_mega_moe_v32 (v30: renamed from cooperative_v29, see git log
+// JIT cache key: sm90_mega_moe_v33 (v30: renamed from cooperative_v29, see git log
 // for the numerics history — bit-exact vs sglang DeepEP; v31: chunked dispatch pull;
-// v32: L2 pingpong — 128-wide L2 tiles owned by alternating math WGs).
+// v32: L2 pingpong; v33: pingpong non-owner participates in full/empty instead of
+// fast-forwarding — a local-only skip aliases the mbarrier parity wait and hangs).
 // Trap-only asserts / no printf: vprintf causes ptxas C7510 (serialized WGMMA).
 #define DG_DEVICE_ASSERT(cond) do {{ if (not (cond)) asm("trap;"); }} while (0)
 #define DG_NO_DEVICE_PRINTF
