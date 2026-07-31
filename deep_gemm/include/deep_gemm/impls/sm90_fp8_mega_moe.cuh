@@ -25,36 +25,12 @@
 
 namespace deep_gemm {
 
-// ============================================================================
-// SM90 (Hopper) FP8 MegaMoE — N-split cooperative kernel
-// ----------------------------------------------------------------------------
-// BLOCK_M=64, BLOCK_N=256: the two math warpgroups cooperatively N-split a
-// single tile (each owns a 128-col half = one m64n128 WGMMA, 64 accum-floats
-// per thread) and share one A-tile (activation) load, halving activation HBM
-// traffic. This is the dual of the former M-split kernel ("share A, split B").
-// A 256-thread cross-warpgroup barrier (a) reduces the per-row amax across the
-// two 64-col output halves so a single per-128 SF covers the full 128 columns,
-// and (b) closes the L2 epilogue so a warpgroup cannot overwrite the shared CD
-// SMEM while the other still scatters it.
-//
-// Pipeline (cluster=1, no TMA multicast):
-//   * Dispatch warps: pull tokens (FP8) and SF (per-128 channel float) from
-//     remote ranks via NVLink into the local L1 pool.
-//   * GEMM TMA-load warps (1 for A+SFA, 1 for B+SFB) feed the pipeline stages.
-//   * Math warpgroups (2, totalling kNumEpilogueThreads) BOTH consume each
-//     stage with WGMMA over their own 128-col B-half (A shared), accumulate
-//     into registers, then run the epilogue:
-//       - L1 (Linear1): SwiGLU with gate/up granularity-8 interleaved layout.
-//         Each WG computes the per-row amax over ITS 64 post-SwiGLU columns;
-//         the two WGs then cross-reduce (max) via SMEM so one per-128 SF covers
-//         all 128 columns of the L1 block (matching the standard DeepEP runner's
-//         scale_block_size=128). FP8 e4m3 quantize with the shared SF, write the
-//         two 64-col halves into one staging tile, single full-tile TMA store.
-//       - L2 (Linear2): BF16 cast of the GEMM output, STSM into SMEM, then
-//         NVLink scatter to remote combine buffers (each WG its own 128-col half).
-//   * After all GEMM blocks, the math warps run the COMBINE step (top-k
-//     reduction in BF16) — ported verbatim from the SM100 kernel.
-// ============================================================================
+// SM90 (Hopper) FP8 MegaMoE — N-split kernel.
+// BLOCK_M=64, BLOCK_N=256: the two math warpgroups N-split each tile (one
+// m64n128 WGMMA per WG) and share one A-tile load. The L1 epilogue
+// cross-reduces the per-row amax over the two 64-col halves via SMEM so a
+// single per-128 SF covers the full 128 post-SwiGLU columns; the L2 epilogue
+// casts to BF16 and NVLink-scatters to remote combine buffers.
 template <
     uint32_t kNumMaxTokensPerRank,
     uint32_t kHidden, uint32_t kIntermediateHidden,
@@ -82,25 +58,23 @@ template <
     uint32_t kNumTokensPerWarp       = 32 / kNumTopk,
     uint32_t kNumExpertsPerRank      = kNumExperts / kNumRanks>
 CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
-sm90_fp8_mega_moe_cooperative_impl(void* y,
-                                   int* cumulative_local_expert_recv_stats,
-                                   const uint32_t num_tokens,
-                                   const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
-                                   const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
-                                   const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf,
-                                   const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights,
-                                   const float* __restrict__ l1_weights_sf,
-                                   const __grid_constant__ cute::TmaDescriptor tensor_map_l1_output,
-                                   const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
-                                   const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
-                                   const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
-                                   const float* __restrict__ l2_weights_sf) {
+sm90_fp8_mega_moe_impl(void* y,
+                       int* cumulative_local_expert_recv_stats,
+                       const uint32_t num_tokens,
+                       const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
+                       const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
+                       const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf,
+                       const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights,
+                       const float* __restrict__ l1_weights_sf,
+                       const __grid_constant__ cute::TmaDescriptor tensor_map_l1_output,
+                       const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
+                       const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
+                       const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
+                       const float* __restrict__ l2_weights_sf) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900) and (__CUDA_ARCH__ < 1000))
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
-    // =====================================================================
     // Template checks
-    // =====================================================================
     DG_STATIC_ASSERT(kNumDispatchThreads % 32 == 0, "Invalid number of dispatch threads");
     DG_STATIC_ASSERT(kNumNonEpilogueThreads % 32 == 0, "Invalid number of GEMM TMA warps");
     DG_STATIC_ASSERT(kNumDispatchThreads + kNumNonEpilogueThreads == 128,
@@ -111,9 +85,7 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
     DG_STATIC_ASSERT(BLOCK_N == 256, "BLOCK_N is fixed to 256 (N-split into two 128-col halves)");
     DG_STATIC_ASSERT(BLOCK_K == 128, "BLOCK_K is fixed to 128 (per-128 SF)");
 
-    // =====================================================================
     // Thread / warp identification
-    // =====================================================================
     const uint32_t sm_idx     = blockIdx.x;
     const uint32_t thread_idx = threadIdx.x;
     const uint32_t warp_idx   = cutlass::canonical_warp_idx_sync();
@@ -130,21 +102,17 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
         cute::prefetch_tma_descriptor(&tensor_map_l2_weights);
     }
 
-    // =====================================================================
-    // Workspaces and symmetric buffer slicing (mirror SM100 layout, except SF
-    // for L2 activations uses per-64 K granularity)
-    // =====================================================================
+    // Workspaces and symmetric buffer slicing (mirror SM100 layout; both L1
+    // and L2 activation SF are per-128 K float)
     const auto workspace = layout::Workspace(
         sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk);
 
     constexpr auto fp8_token_layout              = layout::Data(kHidden);
     constexpr auto bf16_token_layout             = layout::Data(kHidden * sizeof(nv_bfloat16));
     constexpr auto fp8_intermediate_token_layout = layout::Data(kIntermediateHidden);
-    // Per-128 K float SF: 4 bytes per per-128 group => `kHidden / 32` bytes/token (same as SM100 packing)
+    // Per-128 K float SF: 4 bytes per group => `kHidden / 32` bytes/token
     constexpr auto fp8_sf_layout = layout::Data(kHidden / 32);
-    // Per-128 K float SF: 4 bytes per per-128 group => `kIntermediateHidden / 32` bytes/token.
-    // MUST match the host buffer allocation in `get_symm_buffer_size_for_mega_moe`
-    // (mega.hpp), else the following buffers (combine) are mis-positioned.
+    // NOTES: must match the host buffer allocation in `get_symm_buffer_size_for_mega_moe`
     constexpr auto fp8_intermediate_sf_layout = layout::Data(kIntermediateHidden / 32);
     constexpr auto input_topk_idx_layout      = layout::Data(kNumTopk * sizeof(int64_t), false);
     constexpr auto input_topk_weights_layout  = layout::Data(kNumTopk * sizeof(float), false);
@@ -168,34 +136,26 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
     // Combine input area
     const auto combine_token_buffer = layout::Buffer(bf16_token_layout, kNumTopk, kNumMaxTokensPerRank, l2_sf_buffer.get_end_ptr());
 
-    // =====================================================================
     // GEMM data types and shape constants
-    // =====================================================================
     using a_dtype_t = cutlass::float_e4m3_t;
     using b_dtype_t = cutlass::float_e4m3_t;
-    // N-split: each math warpgroup owns WG_BLOCK_N = BLOCK_N / 2 = 128 columns,
-    // so the per-WG WGMMA is m64n128 (64 accum-floats/thread — identical to the
-    // old M-split WG, hence no register spill).
+    // N-split: each math WG owns WG_BLOCK_N = 128 columns (one m64n128 WGMMA, 64 accum-floats/thread)
     constexpr uint32_t WG_BLOCK_N = BLOCK_N / 2;                                          // 128
     using L1WGMMA                 = typename mma::sm90::FP8MMASelector<WG_BLOCK_N>::type; // M=64, N=128, K=32
     using L2WGMMA                 = typename mma::sm90::FP8MMASelector<WG_BLOCK_N>::type;
     static_assert(L1WGMMA::M == 64 and L1WGMMA::N == WG_BLOCK_N and L1WGMMA::K == 32,
                   "Unexpected WGMMA shape");
 
-    // Cluster=1 -> no multicast. A is loaded full-sized (BLOCK_M=64 rows, SHARED
-    // by both WGs); B is loaded full-sized (BLOCK_N=256 cols, SPLIT across WGs).
+    // Cluster=1, no multicast: A (shared by both WGs) and B (split across WGs) are loaded full-sized
     constexpr uint32_t LOAD_BLOCK_M   = BLOCK_M;                     // 64
     constexpr uint32_t LOAD_BLOCK_N   = BLOCK_N;                     // 256
     constexpr uint32_t L1_OUT_BLOCK_N = BLOCK_N / 2;                 // 128 post-SwiGLU (one per-128 SF group)
     constexpr uint32_t kSwizzleAMode  = BLOCK_K * sizeof(a_dtype_t); // 128
     constexpr uint32_t kSwizzleBMode  = BLOCK_K * sizeof(b_dtype_t); // 128
-    constexpr uint32_t kSwizzleCDMode = 128;
     constexpr uint32_t kGranK         = 128; // L1 acts SF, weights SF
     constexpr uint32_t kL2ActsSFGranK = 128; // L2 acts SF (per-128 K, matches DeepEP)
 
-    // =====================================================================
     // Shared memory layout
-    // =====================================================================
     constexpr uint32_t kSharedMemoryAlignment = 1024;
     extern __shared__ __align__(kSharedMemoryAlignment) uint8_t smem_buffer[];
 
@@ -205,23 +165,16 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
         math::constexpr_align(fp8_token_layout.get_num_bytes() * kNumDispatchWarps, kSharedMemoryAlignment);
     constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(a_dtype_t);
     constexpr uint32_t SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
-    // SFA per-stage: BLOCK_M floats. Both L1 and L2 are per-128 K, so one
-    // BLOCK_K=128 tile maps to exactly one SF group per row.
+    // SFA per-stage: one BLOCK_K=128 tile maps to exactly one per-128 SF group per row
     constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE =
         math::constexpr_align<uint32_t>(BLOCK_M * sizeof(float), 128u);
-    // Block (128, 128) weight SF: 1 float per (WG_BLOCK_N, BLOCK_K) tile for L2,
-    // 2 floats (gate/up) for L1. Loaded by math warpgroup directly from global,
-    // so no SMEM is needed.
+    // Block (128, 128) weight SF is loaded by the math WGs directly from global, no SMEM
     constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = 0;
 
-    // CD output: max of L1 FP8 (BLOCK_M * L1_OUT_BLOCK_N * 1 byte) and
-    // L2 BF16 (BLOCK_M * BLOCK_N * 2 bytes).  The tile covers all BLOCK_M rows
-    // and the full N; each warpgroup writes its own 128-col half (N-split)
-    // within that single staging tile.
-    // CD output is DOUBLE-BUFFERED: while one buffer's tile is being TMA-stored to
-    // HBM, the next tile's MMA + epilogue writes the other buffer, overlapping the
-    // store latency with compute. kNumCDStages buffers; the host pipeline config
-    // accounts for the 2x CD region (one fewer GEMM stage in exchange).
+    // CD staging: max of L1 FP8 (BLOCK_M x L1_OUT_BLOCK_N) and L2 BF16 (BLOCK_M x BLOCK_N);
+    // each WG writes its own 128-col half of a single full tile.
+    // Double-buffered so a tile's TMA store drains while the next tile's MMA+epilogue
+    // fills the other buffer (the host pipeline config accounts for the 2x CD region).
     constexpr uint32_t kNumCDStages     = 2;
     constexpr uint32_t SMEM_CD_L1_SIZE  = BLOCK_M * L1_OUT_BLOCK_N * sizeof(cutlass::float_e4m3_t);
     constexpr uint32_t SMEM_CD_L2_SIZE  = BLOCK_M * BLOCK_N * sizeof(nv_bfloat16);
@@ -229,12 +182,8 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
         SMEM_CD_L1_SIZE > SMEM_CD_L2_SIZE ? SMEM_CD_L1_SIZE : SMEM_CD_L2_SIZE, kSharedMemoryAlignment);
     constexpr uint32_t SMEM_CD_SIZE = kNumCDStages * SMEM_CD_BUF_SIZE;
 
-    // Cross-warpgroup per-row amax exchange (N-split L1 epilogue): each WG writes
-    // its 64-col-half per-row amax (BLOCK_M floats, one slot per row), then both
-    // read the other half and take the max → one shared per-128 SF. Two
-    // BLOCK_M-float regions (one per WG), single-buffered (written then read
-    // within one tile's barrier-protected epilogue). Must match the host
-    // `smem_amax` accounting.
+    // Cross-WG per-row amax exchange for the L1 epilogue (one BLOCK_M-float slot per WG);
+    // must match the host `smem_amax` accounting
     constexpr uint32_t SMEM_AMAX_SIZE = math::constexpr_align<uint32_t>(
         2 * BLOCK_M * sizeof(float), kSharedMemoryAlignment);
 
@@ -251,8 +200,7 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
     auto smem_gemm_base = math::advance_ptr(
         smem_buffer, SMEM_EXPERT_COUNT_SIZE + SMEM_SEND_BUFFER_SIZE);
 
-    // CD output is shared by L1 (FP8) and L2 (BF16); reinterpret-cast as needed.
-    // Double-buffered: smem_cd_l1(buf)/smem_cd_l2(buf) select buffer `buf` in {0,1}.
+    // CD staging is shared by L1 (FP8) and L2 (BF16); reinterpret-cast per phase
     auto smem_cd_l1 = utils::PatternVisitor([=](const uint32_t& buf) {
         return reinterpret_cast<cutlass::float_e4m3_t*>(
             math::advance_ptr(smem_gemm_base, buf * SMEM_CD_BUF_SIZE));
@@ -262,8 +210,7 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
             math::advance_ptr(smem_gemm_base, buf * SMEM_CD_BUF_SIZE));
     });
 
-    // Cross-WG amax exchange region (right after CD). `smem_amax[wg]` points at
-    // that WG's BLOCK_M-float per-row amax slots.
+    // Cross-WG amax exchange region: `smem_amax[wg]` = that WG's BLOCK_M per-row amax slots
     auto smem_amax = utils::PatternVisitor([=](const uint32_t& wg) {
         return reinterpret_cast<float*>(
             math::advance_ptr(smem_gemm_base, SMEM_CD_SIZE + wg * BLOCK_M * sizeof(float)));
@@ -282,10 +229,8 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
         return reinterpret_cast<float*>(sf_start_ptr + i * SMEM_SFA_SIZE_PER_STAGE);
     });
 
-    // Barriers live after SF (SFB is loaded directly from global, no SMEM).
-    // Layout: dispatch | full | empty | combine | order
-    //   order_barriers: pingpong `OrderedSequenceBarrier<2,2>` flattened as
-    //   `[ord_stage * 2 + wg]`, 2 stages (MMA/EPI) x 2 math WGs.
+    // Barrier layout: dispatch | full | empty | combine | order
+    // NOTES: order_barriers are reserved for the L2 pingpong path (unused for now)
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(
         sf_start_ptr + kNumStages * SMEM_SFA_SIZE_PER_STAGE);
     auto dispatch_barriers = utils::PatternVisitor([=](const uint32_t& i) {
@@ -304,9 +249,7 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
         return barrier_start_ptr + kNumDispatchWarps + kNumStages * 2 + kNumEpilogueWarps * 2 + i;
     });
 
-    // =====================================================================
     // Initialization
-    // =====================================================================
     if (warp_idx == 0) {
 // Clean expert-count shared memory
 #pragma unroll
@@ -319,29 +262,19 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
             dispatch_barriers[i]->init(1);
         cutlass::arch::fence_barrier_init();
     } else if (warp_idx == 2) {
-        // Init GEMM full/empty, combine, and pingpong order barriers
+        // Init GEMM full/empty, combine, and order barriers
         if (cute::elect_one_sync()) {
-            // COOP-FUSED: BOTH math WGs cooperatively consume EVERY pipeline stage
-            // (M-split: WG0 rows 0..63, WG1 rows 64..127 of the same tile). So each
-            // stage's `empty` barrier must be released by ALL epilogue warps (both
-            // WGs), not just one WG's warps.
-            constexpr uint32_t kNumWarpsPerEpilogueWG = kNumEpilogueWarps / kNumEpilogueWarpgroups;
-            (void)kNumWarpsPerEpilogueWG;
 #pragma unroll
             for (uint32_t i = 0; i < kNumStages; ++i) {
-                // Two producer warps (A+SFA loader, B+SFB loader) each call
-                // `arrive_and_expect_tx` per stage, so init count must be 2.
+                // 2 producer warps (A+SFA loader, B+SFB loader)
                 full_barriers[i]->init(2);
-                // One arrive per warp of BOTH WGs (lane 0 of each of the 8 epilogue
-                // warps) → init = kNumEpilogueWarps.
+                // Released by lane 0 of every epilogue warp (both WGs consume every stage)
                 empty_barriers[i]->init(kNumEpilogueWarps);
             }
 #pragma unroll
             for (uint32_t i = 0; i < kNumEpilogueWarps * 2; ++i)
                 combine_barriers[i]->init(1);
-            // NOTE: order_barriers (OrderedSequenceBarrier) are unused in the cooperative
-            // M-split path (the 2 WGs run the same tile in lockstep, not interleaved),
-            // but the SMEM slots stay allocated; init them harmlessly.
+            // Reserved for the L2 pingpong path; init harmlessly
 #pragma unroll
             for (uint32_t i = 0; i < 4; ++i)
                 order_barriers[i]->init(128);
@@ -350,9 +283,7 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
     }
     __syncthreads();
 
-    // =====================================================================
     // Scheduler (cluster=1)
-    // =====================================================================
     auto scheduler = sched::MegaMoEScheduler<
         BLOCK_M, BLOCK_N, BLOCK_K,
         L1_SHAPE_N, L1_SHAPE_K,
@@ -379,21 +310,11 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
     constexpr uint32_t kBeforeCombineReduceBarrierTag = 2;
     constexpr uint32_t kAfterWorkspaceCleanBarrierTag = 3;
 
-    // Register reconfiguration counts.
-    // Dispatch (2 warps) + TMA (2 warps) share HW warpgroup 0 → same dealloc.
-    // setmaxnreg values must be multiples of 8.
-    //
-    // With 2 math warpgroups (256 epilogue threads, block_m=128):
-    //   128*48 + 256*224 = 6144 + 57344 = 63488 ≤ 64512.
-    //   __launch_bounds__(384, 1) → initial 170 regs/thread.
-    //
-    // With 1 math warpgroup (128 epilogue threads, block_m=64):
-    //   128*48 + 128*232 = 6144 + 29696 = 35840 ≤ 64512.
-    //   __launch_bounds__(256, 1) → initial 252 regs/thread.
-    //   More register headroom, so math warps get 232 instead of 224.
+    // Register reconfiguration: dispatch + TMA warps share HW WG0 (same dealloc);
+    // budget = 128*48 + 256*224 = 63488 <= 64512, setmaxnreg must be a multiple of 8
     constexpr uint32_t kNumDispatchRegisters    = 48;
     constexpr uint32_t kNumNonEpilogueRegisters = 48;  // must match dispatch (same HW WG)
-    constexpr uint32_t kNumEpilogueRegisters    = 224; // pingpong: always 2 math WGs
+    constexpr uint32_t kNumEpilogueRegisters    = 224;
     DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
                              kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
                              kNumEpilogueRegisters * kNumEpilogueThreads <=
@@ -403,15 +324,8 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
     constexpr uint32_t kDispatchGridSyncIndex = 0;
     constexpr uint32_t kEpilogueGridSyncIndex = 1;
 
-    // =====================================================================
-    // ROLE 1: DISPATCH WARPS
-    //   Mirrors SM100 dispatch with two changes:
-    //     * SF is per-128 channel float (no UTCCP transpose). We store the
-    //       remote per-token SF directly into the local L1 SF buffer in
-    //       MN-major layout: `local_sf[k_chunk * num_padded_sf_pool_tokens + token_idx]`.
-    //     * The "token_idx_in_expert" → SF token index is now the simple
-    //       per-block linear mapping (no 4×32 transpose).
-    // =====================================================================
+    // Dispatch warps: mirror SM100, but SF is per-128 channel float copied
+    // linearly into the MN-major L1 SF buffer (no UTCCP 4x32 transpose)
     if (warp_idx < kNumDispatchWarps) {
         cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
 
@@ -673,16 +587,12 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
             },
             true, false);
 
-        // =====================================================================
-        // ROLE 2: GEMM TMA LOAD warps (load A+SFA, B+SFB)
-        //   Warps inside `kNumNonEpilogueThreads` (= 4 warps): warp 0 loads
-        //   A + SFA, warp 1 loads B + SFB, warps 2..3 idle.
-        // =====================================================================
+        // GEMM TMA load warps: warp 0 loads A+SFA, warp 1 loads B+SFB, the rest idle
     } else if (warp_idx == kNumDispatchWarps) {
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
-        // Manually inlined scheduler loop (avoids lambda outlining that causes
-        // C7510 WGMMA serialization warnings in the math warpgroup path).
+        // NOTES: manually inlined scheduler loop, avoids lambda outlining that
+        // causes C7510 WGMMA serialization in the math warpgroup path
         scheduler.fetch_expert_recv_count();
         scheduler.set_expert_idx(0);
         while (true) {
@@ -730,9 +640,7 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                         tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx],
                         k_idx, m_idx, 1);
 
-                    // TMA load SFA — both L1 and L2 are per-128 K, so one
-                    // BLOCK_K=128 tile is exactly one SF group: load (BLOCK_M, 1)
-                    // at K=k_block_idx. (L1 and L2 are now identical here.)
+                    // TMA load SFA: one BLOCK_K=128 tile = one per-128 SF group, box (BLOCK_M, 1)
                     tma::copy<BLOCK_M, 1, 0, float>(
                         tensor_map_sfa_ptr, full_barriers[stage_idx], smem_sfa[stage_idx],
                         m_idx, k_block_idx, 1);
@@ -746,7 +654,7 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
     } else if (warp_idx == kNumDispatchWarps + 1) {
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
-        // Manually inlined scheduler loop (matches A loader expansion).
+        // Manually inlined scheduler loop (matches A loader expansion)
         scheduler.fetch_expert_recv_count();
         scheduler.set_expert_idx(0);
         while (true) {
@@ -769,7 +677,7 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     const uint32_t n_idx = local_expert_idx * shape_n + n_block_idx * BLOCK_N;
                     const uint32_t k_idx = k_block_idx * BLOCK_K;
 
-                    // TMA load B (weight SF is now loaded directly by math warps from global)
+                    // TMA load B (weight SF is loaded by math warps directly from global)
                     tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(
                         tensor_map_b_ptr, full_barriers[stage_idx], smem_b[stage_idx],
                         k_idx, n_idx, 1);
@@ -781,16 +689,12 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
         }
 
     } else if (warp_idx < kNumDispatchWarps + kNumMMANonEpilogueWarps) {
-        // Idle non-epilogue warps (if any). With 2 dispatch + 2 TMA = 4
-        // warps filling HW WG0 exactly, this branch is dead — but kept
-        // for generality. They still must participate in the warpgroup-
-        // collective `setmaxnreg.dec.sync.aligned`.
+        // Idle non-epilogue warps (dead with 2 dispatch + 2 TMA warps filling HW WG0);
+        // must still join the warpgroup-collective setmaxnreg
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
     } else if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
-        // =====================================================================
-        // ROLE 3: MATH WARPGROUPS (WGMMA + epilogue + combine)
-        // =====================================================================
+        // Math warpgroups: WGMMA + epilogue + combine
         cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();
 
         const uint32_t epilogue_warp_idx   = warp_idx - (kNumDispatchWarps + kNumMMANonEpilogueWarps);
@@ -804,35 +708,25 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
         const uint32_t r_0     = warp_idx_in_wg * 16 + row_idx;
         const uint32_t r_1     = r_0 + 8;
 
-        // COOP N-split: the two math WGs cooperatively process the SAME tile, each
-        // owning HALF the BLOCK_N columns. WG g owns cols [g*WG_BLOCK_N, (g+1)*WG_BLOCK_N).
-        // One m64n128 WGMMA per WG per k-block over the SAME BLOCK_M=64 rows; the
-        // shared A tile is loaded ONCE and read by both WGs (this halves the
-        // activation HBM traffic vs the old M-split's per-tile A).
-        DG_STATIC_ASSERT(WG_BLOCK_N == L1WGMMA::N, "Cooperative N-split: WG_BLOCK_N must equal one WGMMA N (128)");
-        DG_STATIC_ASSERT(kNumEpilogueWarpgroups == 2, "Cooperative requires exactly 2 math warpgroups");
-        // This WG's column half within the BLOCK_N-col tile (WG0: 0, WG1: WG_BLOCK_N).
+        // N-split: WG g owns cols [g*WG_BLOCK_N, (g+1)*WG_BLOCK_N) of the same tile;
+        // A + SFA are shared (no row offset), B is offset by this WG's column half
+        DG_STATIC_ASSERT(WG_BLOCK_N == L1WGMMA::N, "WG_BLOCK_N must equal one WGMMA N (128)");
+        DG_STATIC_ASSERT(kNumEpilogueWarpgroups == 2, "N-split requires exactly 2 math warpgroups");
         const uint32_t col_block_offset = epilogue_wg_idx * WG_BLOCK_N;
-        // B SMEM offset for this WG's columns (A + SFA are shared → no row offset).
-        const uint32_t b_col_off = col_block_offset * BLOCK_K; // elems into smem_b
-        // A and SFA are shared: both WGs read rows [0, BLOCK_M).
-        constexpr uint32_t a_row_off   = 0;
-        constexpr uint32_t sfa_row_off = 0;
+        const uint32_t b_col_off        = col_block_offset * BLOCK_K; // elems into smem_b
+        constexpr uint32_t a_row_off    = 0;
+        constexpr uint32_t sfa_row_off  = 0;
 
         // Sync with dispatch
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
-        // Manually inlined scheduler loop — CRITICAL: avoids lambda outlining
-        // that causes ptxas C7510 "wgmma.mma_async serialized due to function
-        // call boundary" warnings, which serialise the WGMMA pipeline.
+        // NOTES: manually inlined scheduler loop, avoids lambda outlining that
+        // causes ptxas C7510 (serialized WGMMA pipeline)
         scheduler.fetch_expert_recv_count();
         scheduler.set_expert_idx(0);
         uint32_t pos = 0;
-        // Deferred L1-store completion + L2 notification (double-buffered CD).
-        // We issue tile N's TMA store, then keep computing tile N+1 while it drains.
-        // The arrival-mask bit (which tells L2 the L1 output is in HBM) is set only
-        // AFTER the store completes, so we defer it by one L1 tile and flush the
-        // last pending one when L1 finishes (before any L2 reads it).
+        // Deferred L1-store retirement: a tile's arrival-mask bit (which tells L2 the
+        // L1 output is in HBM) is published one tile late, after its TMA store drains
         bool l1_store_pending              = false;
         uint32_t l1_pending_pool_block_idx = 0;
         uint32_t l1_pending_n_block_idx    = 0;
@@ -844,21 +738,16 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                                           ? L2_SHAPE_K / BLOCK_K
                                           : L1_SHAPE_K / BLOCK_K;
 
-            // COOP: BOTH WGs process EVERY tile (no pos%2 skip). Each WG handles its
-            // own WG_BLOCK_N column half of this tile via col_block_offset.
+            // Both WGs process every tile, each handling its own column half
             const uint32_t valid_m        = scheduler.template get_valid_m<false>();
             const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
             const uint32_t m_idx          = pool_block_idx * BLOCK_M;
-            // Double-buffered CD staging tile: alternate per tile so the previous
-            // tile's L1 TMA store can drain in the background while this tile's
-            // MMA + epilogue fills the other buffer.
+            // Alternate CD buffer per tile so the previous L1 store drains in the background
             const uint32_t cd_buf = pos % kNumCDStages;
             const uint32_t n_idx  = n_block_idx * BLOCK_N;
 
-            // Flush any deferred L1 store BEFORE starting an L2 tile: the L2 loader
-            // spins on the arrival mask, so the last L1 tile's store must complete
-            // and its mask bit be published before L2 begins (scheduler emits all L1
-            // blocks of a wave, then all L2 blocks, so this fires at the transition).
+            // L1->L2 transition: flush the deferred L1 store so its mask bit is
+            // published before any L2 loader spins on it
             if (block_phase == sched::BlockPhase::Linear2 and l1_store_pending) {
                 ptx::tma_store_wait<0>();
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
@@ -870,38 +759,27 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                 l1_store_pending = false;
             }
 
-            // ---------------- GEMM (MMA region; 2 WGs cooperate on this tile) ----------------
+            // GEMM (MMA region)
             using WGMMA                        = L1WGMMA;
             constexpr uint32_t kAccumPerThread = WGMMA::kNumAccum; // 64 for M=64,N=128
             float final_accum[kAccumPerThread] = {};
             float accum[kAccumPerThread];
 
-            // ----- Block (128, 128) weight SF constants (loop-invariant) -----
-            // L1 weight SF shape: (E, 2*IH/128, H/128) MN-major. The N axis is
-            // [gate(IH/128), up(IH/128)]; with the gate/up gran-8 interleave on
-            // the FP8 weight, each BLOCK_N=256 tile covers 16 gate groups + 16 up
-            // groups = the full 128 original rows of gate plus 128 of up taken
-            // from the SAME per-128 SF block, so BOTH WGs share:
-            //     gate_sf_n = n_block_idx
-            //     up_sf_n   = (IH/128) + n_block_idx
-            //
-            // L2 weight SF shape: (E, H/128, IH/128) MN-major. One scalar per
-            // (128, BLOCK_K) output block. A BLOCK_N=256 tile spans TWO such
-            // blocks; WG g owns cols [g*128, +128) = SF block n_block_idx*2 + g.
+            // Block (128, 128) weight SF constants (loop-invariant).
+            // L1 SF shape (E, 2*IH/128, H/128) MN-major; the gate/up gran-8 interleave
+            // keeps a 256-wide tile inside ONE gate + ONE up SF block shared by both WGs:
+            // gate_sf_n = n_block_idx, up_sf_n = IH/128 + n_block_idx.
+            // L2 SF shape (E, H/128, IH/128) MN-major; a 256-wide tile spans two blocks,
+            // WG g owns SF block n_block_idx*2 + g.
             constexpr uint32_t kL1SFKBlocks   = kHidden / 128;
             constexpr uint32_t kL2SFKBlocks   = kIntermediateHidden / 128;
             constexpr uint32_t kL1SFGateBlks  = kIntermediateHidden / 128;
             constexpr uint32_t kL1SFPerExpert = (kIntermediateHidden * 2 / 128) * kL1SFKBlocks;
             constexpr uint32_t kL2SFPerExpert = (kHidden / 128) * kL2SFKBlocks;
-            // This WG's L2 output 128-block (N-split: 2 per BLOCK_N=256 tile).
             const uint32_t l2_sf_n_block = n_block_idx * 2u + epilogue_wg_idx;
 
-            // ---- Weight SF software pipelining ----
-            // Issue __ldg for k_block_idx=0 BEFORE the loop.  Inside the loop,
-            // after WGMMA completes (thousands of cycles), we issue __ldg for
-            // the NEXT k-block.  The ~200-cycle L2 latency is then hidden by
-            // SF-scaling + loop overhead + next wait_full_bar — completely off
-            // the critical path.
+            // Weight SF software pipelining: prefetch k=0 before the loop, each iteration
+            // then prefetches the next k after WGMMA (~200-cycle __ldg off the critical path)
             float gate_sf = 0.0f, up_sf = 0.0f, l2_sf = 0.0f;
             const float* l1_sf_base = l1_weights_sf + local_expert_idx * kL1SFPerExpert;
             const float* l2_sf_base = l2_weights_sf + local_expert_idx * kL2SFPerExpert + l2_sf_n_block * kL2SFKBlocks;
@@ -917,11 +795,8 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 full_barriers[stage_idx]->wait(phase);
 
-                // ---- Activation SF: read from SMEM DURING async WGMMA execution ----
-                // The SFA lives in a separate SMEM region from A/B tiles, so ld_shared
-                // for SFA can execute concurrently with wgmma.mma_async reading A/B.
-                // By issuing SFA reads AFTER WGMMA issue but BEFORE warpgroup_wait,
-                // we overlap the ld_shared latency (~20-30 cycles) with WGMMA compute.
+                // Activation SF lives in a separate SMEM region, so its ld_shared is
+                // issued after WGMMA issue and overlaps the async MMA
                 float scale_a_0_lo, scale_a_1_lo;
 
                 if (block_phase == sched::BlockPhase::Linear1) {
@@ -932,8 +807,6 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     ptx::warpgroup_arrive();
 #pragma unroll
                     for (uint32_t k = 0; k < BLOCK_K / WGMMA::K; ++k) {
-                        // COOP N-split: A shared (a_row_off=0); this WG reads its
-                        // own 128 B-cols (b_col_off).
                         auto desc_a = mma::sm90::make_smem_desc(
                             smem_a[stage_idx] + a_row_off + k * WGMMA::K, 1);
                         auto desc_b = mma::sm90::make_smem_desc(
@@ -954,9 +827,7 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     if (lane_idx == 0)
                         empty_barriers[stage_idx]->arrive();
 
-                    // Software-pipelined weight SF prefetch for NEXT k-block.
-                    // Issued here so the ~200-cycle __ldg latency is hidden by
-                    // SF-scaling below + loop overhead + next wait_full_bar.
+                    // Prefetch the next k-block's weight SF
                     const float cur_gate_sf = gate_sf, cur_up_sf = up_sf;
                     if (k_block_idx + 1 < num_k_blocks) {
                         const uint32_t next_k = k_block_idx + 1;
@@ -966,12 +837,8 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                         up_sf                 = __ldg(l1_sf_base + up_n * kL1SFKBlocks + next_k);
                     }
 
-                    // L1: gate/up alternate at gran=8 along N; each `i` block of 8
-                    // cols belongs entirely to one of {gate, up}, so .x and .y
-                    // share the same scalar. Pre-multiply act-SF × weight-SF ONCE
-                    // per k-block (4 muls) so the inner element loop is pure FMA
-                    // (mirrors CUTLASS GmmaFP8Accumulation::scale_core; bit-identical
-                    // since the scale_a×sb multiply order is unchanged).
+                    // Gate/up alternate at gran=8 along N; pre-multiply act-SF x weight-SF
+                    // once per k-block so the inner element loop is pure FMA
                     const float sg0 = scale_a_0_lo * cur_gate_sf;
                     const float sg1 = scale_a_1_lo * cur_gate_sf;
                     const float su0 = scale_a_0_lo * cur_up_sf;
@@ -980,15 +847,8 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     for (uint32_t i = 0; i < kAccumPerThread / 4; ++i) {
                         const float s0          = (i & 1u) ? su0 : sg0;
                         const float s1          = (i & 1u) ? su1 : sg1;
-                        // Use a FUSED multiply-add (single rounding) for the scale+promote.
-                        // DeepGEMM's standard m_grouped GEMM (the sglang/DeepEP reference)
-                        // compiles its `final += scale*accum` promote to FFMA (1 rounding).
-                        // The plain `+=` here was emitting a separate FMUL+FADD (2 roundings),
-                        // which diverged from m_grouped by 1 fp32 ULP per k-block, accumulating
-                        // to a value that lands on the opposite side of a bf16 grid midpoint
-                        // (proven bit-for-bit: k=6 final 0x4162770a vs m_grouped 0x4162770b →
-                        // final 0x41e48000 vs 0x41e48001 → bf16 28.5 vs 28.625). Matching the
-                        // FMA makes the L1/L2 GEMM bit-identical to the reference.
+                        // NOTES: FMA promote (1 rounding) is required for bit-exactness with
+                        // the m_grouped reference; plain mul+add diverges by 1 fp32 ULP
                         final_accum[i * 4 + 0] = __fmaf_rn(s0, accum[i * 4 + 0], final_accum[i * 4 + 0]);
                         final_accum[i * 4 + 1] = __fmaf_rn(s0, accum[i * 4 + 1], final_accum[i * 4 + 1]);
                         final_accum[i * 4 + 2] = __fmaf_rn(s1, accum[i * 4 + 2], final_accum[i * 4 + 2]);
@@ -1002,8 +862,6 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     ptx::warpgroup_arrive();
 #pragma unroll
                     for (uint32_t k = 0; k < BLOCK_K / WGMMA::K; ++k) {
-                        // COOP N-split: A shared (a_row_off=0); this WG reads its
-                        // own 128 B-cols (b_col_off).
                         auto desc_a = mma::sm90::make_smem_desc(
                             smem_a[stage_idx] + a_row_off + k * WGMMA::K, 1);
                         auto desc_b = mma::sm90::make_smem_desc(
@@ -1024,20 +882,18 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     if (lane_idx == 0)
                         empty_barriers[stage_idx]->arrive();
 
-                    // Software-pipelined weight SF prefetch for NEXT k-block.
+                    // Prefetch the next k-block's weight SF
                     const float cur_l2_sf = l2_sf;
                     if (k_block_idx + 1 < num_k_blocks) {
                         l2_sf = __ldg(l2_sf_base + k_block_idx + 1);
                     }
 
-                    // L2: single scalar `cur_l2_sf` broadcast across N. Pre-multiply
-                    // act-SF × weight-SF once (2 muls) → inner loop is pure FMA.
+                    // Single scalar SF broadcast across N; pre-multiply once, inner loop is pure FMA
                     const float s0 = scale_a_0_lo * cur_l2_sf;
                     const float s1 = scale_a_1_lo * cur_l2_sf;
 #pragma unroll
                     for (uint32_t i = 0; i < kAccumPerThread / 4; ++i) {
-                        // FUSED multiply-add (1 rounding) to match m_grouped's FFMA promote
-                        // — see the L1 path above for the bit-level justification.
+                        // FMA promote — see the L1 path
                         final_accum[i * 4 + 0] = __fmaf_rn(s0, accum[i * 4 + 0], final_accum[i * 4 + 0]);
                         final_accum[i * 4 + 1] = __fmaf_rn(s0, accum[i * 4 + 1], final_accum[i * 4 + 1]);
                         final_accum[i * 4 + 2] = __fmaf_rn(s1, accum[i * 4 + 2], final_accum[i * 4 + 2]);
@@ -1046,21 +902,10 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                 }
             }
 
-            // COOP: no MMA/epilogue order handoff — both WGs computed their own
-            // register accumulators for THIS tile and now run their own epilogues
-            // concurrently (each writes its own row band of the shared smem_cd,
-            // coordinated by the per-WG and 256-thread epilogue barriers below).
-
             if (block_phase == sched::BlockPhase::Linear1) {
-                // ---------------- L1 EPILOGUE: SwiGLU + FP8 quantize + TMA store ----------------
-                // Layout in `final_accum`:
-                //   16 chunks of 8 N-cols, each chunk = 4 floats per thread = (r0c0, r0c1, r1c0, r1c1).
-                //   Gate chunks: even (0, 2, ..., 14). Up chunks: odd (1, 3, ..., 15).
-                //   Pair `p` ∈ [0, 8): gate chunk = 2p, up chunk = 2p+1.
-                //
-                // For each pair we produce 4 post-SwiGLU floats per thread, mapped to
-                // output cols (p*8 + col_idx*2 + {0,1}) for both r0 and r1.
-
+                // L1 epilogue: SwiGLU + FP8 quantize + TMA store.
+                // `final_accum` = 16 chunks of 8 N-cols (4 floats/thread: r0c0, r0c1, r1c0, r1c1);
+                // gate chunks even, up chunks odd; pair p covers output cols p*8 + col_idx*2 + {0,1}
                 constexpr uint32_t kNumPairs = kAccumPerThread / 8; // 8 (this WG's 64 output cols)
                 float swiglu_r0[kNumPairs][2];
                 float swiglu_r1[kNumPairs][2];
@@ -1073,21 +918,12 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                 for (uint32_t p = 0; p < kNumPairs; ++p) {
                     const uint32_t gate = 2 * p, up = 2 * p + 1;
 
-                    // L1-output bf16 round (precision-alignment with sglang).
-                    // sglang's standard DeepEP path computes the gate/up GEMM with
-                    // `grouped_gemm_nt_f8f8bf16_contig`, whose epilogue casts the FP32
-                    // WGMMA accumulator to BF16 (`__float22bfloat162_rn`) BEFORE the
-                    // SwiGLU kernel reads it. Our fused kernel keeps the accumulator in
-                    // FP32, which is strictly more accurate but DIVERGES from sglang.
-                    // To match sglang numerically, round each L1 output to BF16 and back
-                    // here (before clamp/SiLU, mirroring sglang's cast-then-activate order).
+                    // NOTES: round the L1 output to bf16 before clamp/SiLU to match sglang's
+                    // grouped_gemm_nt_f8f8bf16 epilogue cast (bit-exactness)
                     auto bf16_round = [](float x) -> float {
                         return __bfloat162float(__float2bfloat16_rn(x));
                     };
-                    // Apply optional clamp on gate / up before SwiGLU
-                    // Match SM100 reference: gate is clamped only on the upper
-                    // side (very-negative gate is fine because SiLU(-inf) -> 0),
-                    // while up is clamped both sides.
+                    // Clamp: gate upper-side only (SiLU(-inf) -> 0), up both sides (matches SM100)
                     auto clamp_gate = [](float& x) {
                         if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity())
                             x = cute::min(x, kActivationClamp);
@@ -1113,17 +949,9 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     float u_r1_c1 = bf16_round(final_accum[up * 4 + 3]);
                     clamp_up(u_r1_c1);
 
-                    // SiLU+mul matching sglang's REAL deepep NORMAL-mode down-proj.
-                    // CONFIRMED by runtime probe: normal mode dispatches to
-                    // `_run_contiguous_gemm` (NOT the masked path), whose down-proj is the
-                    // two ops `sgl_kernel.silu_and_mul` → `sglang_per_token_group_quant_fp8`:
-                    //   silu(g) = g / (1.0f + expf(-g)); out = silu(g) * up; store → BF16.
-                    // sgl_kernel/flashinfer are built with `-use_fast_math`, so the source
-                    // expf/`/` lower to ex2.approx.ftz + div.approx.ftz (and the `*up` to
-                    // mul.ftz). DeepGEMM's JIT does NOT pass -use_fast_math, so when
-                    // kFastMath is set we reproduce that fast-math PTX with inline asm;
-                    // the fp32 silu*up is then ROUNDED to bf16 (the silu_and_mul output),
-                    // which becomes the input to the per-128 quant below.
+                    // SiLU*up matching sglang's `sgl_kernel.silu_and_mul` (built with
+                    // -use_fast_math): kFastMath reproduces its approx PTX via inline asm,
+                    // and the fp32 result is rounded to bf16 (that op's output dtype)
                     auto silu_mul = [](float x, float u) -> float {
                         float o;
                         if constexpr (kFastMath) {
@@ -1149,30 +977,16 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     amax_r1 = cute::max(amax_r1, cute::max(cute::abs(swiglu_r1[p][0]), cute::abs(swiglu_r1[p][1])));
                 }
 
-                // NOTE: the topk routing weight is NOT applied here. sglang/DeepEP
-                // quantize the UNWEIGHTED SwiGLU output for the L2 input and apply the
-                // per-token topk weight only at combine (after the L2 GEMM). Applying
-                // it pre-quant would make the fp8 quantization see `weight*swiglu` and
-                // pick different e4m3 codes than sglang, breaking bit-exactness. The
-                // weight is applied to the L2 output in the L2 epilogue below.
+                // NOTES: the topk weight is NOT applied here — sglang quantizes the
+                // unweighted SwiGLU output and applies the weight only at combine
 
-                // Reduce amax across the 4 col-lanes that share the same row.
-                // In WGMMA m64n128k32 output, the 4 lanes (`lane_idx & 3` differs,
-                // `lane_idx >> 2` same) hold all N positions for the same r_0/r_1,
-                // so we need an INTRA-group reduction (`xor 1, xor 2`), which is
-                // `warp_reduce<4, false>`. Using `<4, true>` would instead merge
-                // amax across 8 different rows -- giving wrong per-row SF.
-                // This gives THIS WG's amax over its 64-col half only.
+                // Reduce amax across the 4 col-lanes sharing a row: must be the intra-group
+                // `warp_reduce<4, false>` (`<4, true>` would merge amax across different rows)
                 amax_r0 = math::warp_reduce<4, false>(amax_r0, math::ReduceMax<float>());
                 amax_r1 = math::warp_reduce<4, false>(amax_r1, math::ReduceMax<float>());
 
-                // ---- CROSS-WG per-128 amax reduction (N-split) ----
-                // Each WG has the amax over ITS 64 output columns; the per-128 SF
-                // must cover all 128 columns (both halves). Exchange the two halves'
-                // per-row amax via SMEM and take the max so BOTH WGs derive the SAME
-                // per-128 SF and quantize their halves consistently.
-                // Both WGs share the same BLOCK_M rows; the row a (warp, lane) covers
-                // is identical across WGs, so we index smem_amax by that row.
+                // Cross-WG amax exchange via SMEM so both WGs derive the SAME per-128 SF
+                // covering the two 64-col halves (rows are shared, index by row)
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
 
                 if (col_idx == 0) {
@@ -1187,53 +1001,27 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     amax_r1                 = cute::max(amax_r1, smem_amax[other_wg][r_1]);
                 }
 
-                // Compute SF + quant multiplier, matching sglang's CONTIGUOUS-path quant.
-                // CONFIRMED: `_run_contiguous_gemm` calls `sglang_per_token_group_quant_fp8`
-                // WITHOUT enable_v2 → dispatches to the JIT kernel `per_token_group_quant_8bit`
-                // (sglang/jit_kernel/csrc/gemm/per_token_group_quant_8bit.cuh), NOT the v2
-                // CUDA kernel. That JIT kernel is compiled with default flags
-                // (`-std=c++20 -O3 --expt-relaxed-constexpr`, NO -use_fast_math), so both its
-                // divides are PRECISE div.rn:
-                //   absmax = fmaxf(amax, 1e-10f)
-                //   y_s    = amax / 448        (line 100, TRUE div, STORED scale_inv)
-                //   code   = clamp(val / y_s, ±448) → e4m3 RN-even   (line 122, TRUE div)
-                // BIT-VERIFIED: amax=3328 → amax/448 = 0x40edb6db (matches real sglang),
-                // whereas amax*(1/448f) = 0x40edb6dc (1 ULP high, two roundings). So the
-                // stored SF must be `amax/448` (true div) and the quant must divide by that
-                // SAME stored y_s (NOT multiply by a separately-rounded 448/amax). silu still
-                // uses fast-math approx PTX (sgl_kernel.silu_and_mul IS -use_fast_math); only
-                // these two quant divides are precise (the JIT quant kernel is not fast-math).
+                // Quant matching sglang's `per_token_group_quant_8bit` JIT kernel (NOT
+                // fast-math): stored y_s = amax/448 and code = clamp(val / y_s, ±448),
+                // both PRECISE div.rn — reciprocal-mul forms diverge by 1 ULP
                 constexpr float kE4M3Max = 448.0f;
                 const float amax_c0   = fmaxf(amax_r0, 1e-10f);
                 const float amax_c1   = fmaxf(amax_r1, 1e-10f);
-                const float sf_r0     = amax_c0 / kE4M3Max;      // y_s = amax/448 (div.rn), STORED
+                const float sf_r0     = amax_c0 / kE4M3Max;
                 const float sf_r1     = amax_c1 / kE4M3Max;
-                // Quant divides by the SAME stored y_s (matching `val / y_s`, line 122),
-                // NOT by a separately-rounded reciprocal `448/amax`.
+                // Quant divides by the SAME stored y_s, not a separately-rounded reciprocal
                 const float yscale_r0 = sf_r0;
                 const float yscale_r1 = sf_r1;
 
-                // Quantize and write to smem_cd_l1 (row-major, no swizzle).
-                // The L1-output TMA store descriptor is built with swizzle_mode = 0
-                // to match this plain row-major SMEM staging tile.
-                //
-                // Per pair `p`, each thread holds 4 FP8 values to write at:
-                //   (row r_0, cols wg_off + p*8 + col_idx*2 + {0,1}) -> fp8x2 (2 bytes)
-                //   (row r_1, cols wg_off + p*8 + col_idx*2 + {0,1}) -> fp8x2 (2 bytes)
-                // COOP N-split: both WGs share the full BLOCK_M rows; each writes its
-                // own 64-col half (WG0 cols [0,64), WG1 cols [64,128)) of the single
-                // 128-wide staging tile at column offset `wg_out_col_off`.
+                // Quantize and write to smem_cd_l1 (row-major, matches the swizzle-0 TMA
+                // descriptor); each WG writes its own 64-col half of the 128-wide staging tile
                 constexpr uint32_t WG_OUT_BLOCK_N = L1WGMMA::N / 2; // 64 output cols/WG
                 const uint32_t wg_out_col_off     = epilogue_wg_idx * WG_OUT_BLOCK_N;
                 auto* smem_cd_l1_buf              = smem_cd_l1[cd_buf];
 #pragma unroll
                 for (uint32_t p = 0; p < kNumPairs; ++p) {
-                    // Quantize: `q = clamp(val / y_s, ±448)` → e4m3 RN, matching the JIT
-                    // quant kernel's `val / y_s` (true div.rn, line 122) + clamp + cvt.
-                    // `val` is the bf16-rounded SwiGLU; `ys` is the STORED y_s = amax/448.
-                    // NOTE: divide by y_s (NOT multiply by 448/amax) — the JIT kernel reuses
-                    // the same stored y_s for the divide, so a separately-rounded reciprocal
-                    // would diverge by 1 ULP at e4m3 grid midpoints.
+                    // True div by the stored y_s (a separately-rounded reciprocal diverges
+                    // by 1 ULP at e4m3 grid midpoints)
                     auto qmul = [](float v, float ys) -> float {
                         return fminf(fmaxf(v / ys, -448.0f), 448.0f);
                     };
@@ -1254,9 +1042,8 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     *p1 = r1_pair.__x;
                 }
 
-                // Write the shared per-128 SF as float at `[token, n_block_idx]` in
-                // the L2 acts SF buffer. The two WGs computed an IDENTICAL sf_r* (the
-                // cross-WG amax max above), so only WG0's col_idx==0 lanes write.
+                // Write the shared per-128 SF into the L2 acts SF buffer; both WGs derived
+                // identical sf_r*, so only WG0's col_idx==0 lanes write
                 if (epilogue_wg_idx == 0 and col_idx == 0) {
                     auto sf_base_ptr                                          = l2_sf_buffer.get_base_ptr<float>();
                     const uint32_t token_r0                                   = pool_block_idx * BLOCK_M + r_0;
@@ -1266,12 +1053,10 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     sf_base_ptr[k_sf_idx * kNumPaddedSFPoolTokens + token_r1] = sf_r1;
                 }
 
-                // Both WGs must finish writing their halves of the shared staging
-                // tile before the single full-tile TMA store. 256-thread rendezvous.
+                // 256-thread rendezvous: both halves written before the full-tile store
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
 
-                // SINGLE full-tile TMA store (all BLOCK_M rows, full 128 cols),
-                // issued by one warp of WG0 only.
+                // Single full-tile TMA store, issued by one warp of WG0 only
                 if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
                     const uint32_t out_n_idx = n_block_idx * L1_OUT_BLOCK_N;
                     cute::tma_store_fence();
@@ -1284,13 +1069,9 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                 }
                 __syncwarp();
 
-                // DOUBLE-BUFFERED store/compute overlap: do NOT wait for THIS tile's
-                // store here. Both WGs rendezvous (256-thread) so this buffer's store
-                // has been fully issued, then we retire the PREVIOUS pending L1 store:
-                // tma_store_wait<1> guarantees at most 1 store in flight (i.e. the
-                // previous one — same buffer two tiles ago — has completed), so its
-                // arrival-mask bit is now safe to publish to L2. This tile's own store
-                // keeps draining in the background while the next tile's MMA runs.
+                // Retire the PREVIOUS pending L1 store (tma_store_wait<1> leaves this tile's
+                // store in flight) and publish its arrival-mask bit; this tile's own store
+                // keeps draining while the next tile's MMA runs
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 if (l1_store_pending) {
                     ptx::tma_store_wait<1>();
@@ -1304,35 +1085,18 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                 l1_pending_pool_block_idx = pool_block_idx;
                 l1_pending_n_block_idx    = n_block_idx;
             } else {
-                // ---------------- L2 EPILOGUE: BF16 cast + NVLink scatter ----------------
-                // N-split: both WGs share the BLOCK_M=64 rows; each owns its 128-col
-                // half. Each WG writes its half into the shared 256-wide smem_cd_l2
-                // tile and then scatters ITS OWN 128 cols of all rows (no cross-WG
-                // SMEM read, no double-scatter — the two halves go to disjoint
-                // destination columns n_idx + col_block_offset).
+                // L2 epilogue: BF16 cast + NVLink scatter; each WG writes and scatters its
+                // own 128-col half (disjoint destination columns)
                 constexpr uint32_t kNumRowsPerWarp = BLOCK_M / 8;
 
-                // Do NOT apply the topk routing weight here. sglang's REAL deepep does
-                // NOT weight the L2 output before combine — instead `ep_gather`
-                // (_fwd_kernel_ep_gather) does the INTRA-RANK reduction in FP32:
-                //   acc(fp32) += L2_bf16.to(fp32) * topk_weight   (NO per-expert round)
-                //   gather_out = acc.to(bf16)                     (ONE round per rank)
-                // and the cross-rank deep_ep combine then sums those bf16 per-rank
-                // results (unweighted). We replicate this TWO-LAYER model entirely in
-                // the COMBINE epilogue below (group topk slots by their sender rank,
-                // fp32-accumulate `L2_bf16*weight` per group → bf16, then sum groups).
-                // So here we scatter the RAW (unweighted) L2 output as bf16; the GEMM
-                // accumulator's single bf16 cast is the L2 GEMM's own bf16 output.
-// STSM into smem_cd_l2 (BF16). Reuse SM100 column-swizzle layout.
+                // NOTES: scatter the RAW (unweighted) bf16 L2 output — sglang applies the
+                // topk weight only at combine (see the two-layer combine below)
 #pragma unroll
                 for (uint32_t i = 0; i < kAccumPerThread / 8; ++i) {
-                    // Each i consumes 8 floats (one 16x256b chunk in SM100 terms).
-                    // For SM90 WGMMA layout, 8 floats per i correspond to 2 chunks of 4 floats:
-                    //   final_accum[i*8 + (0..3)] = chunk 2i: (r0c0, r0c1, r1c0, r1c1)
-                    //   final_accum[i*8 + (4..7)] = chunk 2i+1: same shape
+                    // 8 floats per i = 2 chunks of (r0c0, r0c1, r1c0, r1c1)
                     const uint32_t chunk_lo = 2 * i, chunk_hi = 2 * i + 1;
 
-                    // Pack each (row, col) pair into BF162 (weight already applied)
+                    // Pack each (row, col) pair into BF162
                     const uint32_t r0_lo = math::cast_into_bf16_and_pack(
                         final_accum[chunk_lo * 4 + 0], final_accum[chunk_lo * 4 + 1]);
                     const uint32_t r1_lo = math::cast_into_bf16_and_pack(
@@ -1342,11 +1106,9 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     const uint32_t r1_hi = math::cast_into_bf16_and_pack(
                         final_accum[chunk_hi * 4 + 2], final_accum[chunk_hi * 4 + 3]);
 
-                    // Write to SMEM at this WG's column half (col_block_offset).
-                    // Row r_0/r_1 are shared across WGs (no row offset).
+                    // Write to SMEM at this WG's column half (rows shared across WGs)
                     auto write_pair = [&](uint32_t row, uint32_t col, uint32_t packed) {
                         auto smem_ptr = smem_cd_l2[cd_buf] + row * BLOCK_N + col_block_offset + col;
-                        // BF16 STS: 2 bf16 elements
                         *reinterpret_cast<uint32_t*>(smem_ptr) = packed;
                     };
                     write_pair(r_0, chunk_lo * 8 + col_idx * 2, r0_lo);
@@ -1357,10 +1119,7 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
 
                 ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
-                // Scatter to remote ranks via NVLink (one row per warp-pair)
-                // Each warpgroup-warp covers 8 unique rows × 2 (r_0 + r_1 doubled by warps)
-                // Lane group of 16 within a warp → 1 row. Each lane handles this WG's
-                // 128-col half: WG_BLOCK_N / 16 = 8 cols = 1 uint4.
+                // NVLink scatter: 16 lanes per row, each lane 8 cols (1 uint4) of this WG's half
                 const uint32_t row_in_warp_block = lane_idx / 16; // 0 or 1
                 const uint32_t lane_in_row       = lane_idx % 16;
                 const uint32_t cols_per_lane     = WG_BLOCK_N / 16; // 8 cols per lane
@@ -1368,7 +1127,6 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
 
 #pragma unroll
                 for (uint32_t j = 0; j < kNumRowsPerWarp; ++j) {
-                    // N-split: both WGs cover all BLOCK_M rows (no row band offset).
                     const uint32_t tile_row = warp_idx_in_wg * 16 + j * 2 + row_in_warp_block;
                     if (tile_row >= valid_m)
                         break;
@@ -1378,11 +1136,11 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     const uint32_t dst_token_idx = src_metadata.token_idx;
                     const uint32_t dst_topk_idx  = src_metadata.topk_idx;
 
-                    // Read 8 BF16s (= 16 bytes = 1 uint4) from smem (this WG's half).
+                    // Read 8 BF16s (1 uint4) from this WG's half
                     auto smem_ptr     = smem_cd_l2[cd_buf] + tile_row * BLOCK_N + col_block_offset + lane_in_row * cols_per_lane;
                     const auto packed = *reinterpret_cast<uint4*>(smem_ptr);
 
-                    // Write to remote at this WG's destination column offset.
+                    // Write to remote at this WG's destination column offset
                     const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)
                                                .get_data_buffer(dst_token_idx);
                     auto dst_ptr         = math::advance_ptr<uint4>(
@@ -1391,26 +1149,16 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
                 }
 
-                // CROSS-WG tile-boundary rendezvous (256-thread). Both WGs share
-                // one `smem_cd` staging tile (smem_cd_l1 FP8 and smem_cd_l2 BF16
-                // alias the same bytes). Without a cross-WG barrier the two math
-                // WGs can desync by a full tile: WG0 begins writing the NEXT
-                // tile's smem_cd while WG1 is still reading THIS tile's
-                // smem_cd_l2 in the NVLink scatter above. Because the FP8/BF16
-                // element sizes and N extents differ, WG0's next-tile band can
-                // overlap WG1's current-tile band in raw bytes and corrupt the
-                // in-flight scatter (observed as ~1e38 garbage output at large M
-                // where one SM processes multiple tiles). The L1 epilogue already
-                // has the symmetric 256-thread barrier (kEpilogueFullBarrierIdx);
-                // each tile executes exactly one of the two, so the arrival count
-                // (kNumEpilogueThreads) is consistent and cannot deadlock.
+                // Tile-boundary 256-thread rendezvous: without it a WG can start writing the
+                // NEXT tile's smem_cd while the other still scatters THIS tile (the FP8/BF16
+                // layouts alias in raw bytes). L1 runs the symmetric barrier once per tile,
+                // so the arrival counts stay consistent and cannot deadlock
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             }
             ++pos;
         }
 
-        // Flush any still-pending L1 store (e.g. a wave that ended on L1 blocks):
-        // ensure it lands in HBM and its arrival-mask bit is published.
+        // Flush any still-pending L1 store (e.g. a wave ending on L1 blocks)
         if (l1_store_pending) {
             ptx::tma_store_wait<0>();
             ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
@@ -1422,9 +1170,8 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
             l1_store_pending = false;
         }
 
-        // ---------------- COMBINE ----------------
-        // NVLink barrier first: signals remote ranks that this rank's GEMM
-        // outputs (NVLink scatter targets) are fully written.
+        // Combine. NVLink barrier first: signals remote ranks that this rank's
+        // scatter targets are fully written
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumEpilogueThreads,
                              kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag>(
             workspace, sym_buffer, sm_idx, epilogue_thread_idx,
@@ -1432,8 +1179,7 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             });
 
-        // Sync with dispatch (paired with dispatch's pre-cleanup sync) so that
-        // dispatch may now safely clean workspace state.
+        // Sync with dispatch so it may now safely clean workspace state
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
         constexpr uint32_t kNumHiddenBytes   = kHidden * sizeof(nv_bfloat16);
@@ -1471,22 +1217,10 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
         for (uint32_t token_idx = sm_idx * kNumEpilogueWarps + epilogue_warp_idx;
              token_idx < num_tokens;
              token_idx += kNumSMs * kNumEpilogueWarps) {
-            // ---- TWO-LAYER combine (matches sglang's ep_gather + deep_ep combine) ----
-            // sglang does NOT sum all topk contributions in one pass. It first does an
-            // INTRA-RANK reduction (`ep_gather`): per token, fp32-accumulate
-            // `L2_bf16.to(fp32) * topk_weight` over the topk experts on THE SAME rank
-            // (NO intermediate round), then ONE `.to(bf16)` per rank. Then the cross-rank
-            // `deep_ep combine` sums those per-rank bf16 results. Verified bit-exact in
-            // /tmp/combine_model{4,5}.py: a UNIFIED fp32 accumulate of the per-rank bf16
-            // (final round once) reproduces deep_ep's hadd(≤2-rank)/fp32(>2-rank) branch
-            // exactly, because two bf16 values sum exactly in fp32 — so no hadd branch.
-            //
-            // The kernel scatters one UNWEIGHTED bf16 L2 contribution per (token, topk
-            // slot) into `combine_token_buffer.get_rank_buffer(slot)`. Here we group those
-            // slots by SENDER RANK = expert_id / kNumExpertsPerRank, accumulate each
-            // group in fp32 with its weight, round per group, and fp32-sum the groups.
-            //
-            // Per-lane slot metadata (lane l < kNumTopk owns slot l).
+            // Two-layer combine matching sglang's ep_gather + deep_ep combine (verified
+            // bit-exact): group topk slots by sender rank (= expert_id / kNumExpertsPerRank),
+            // fp32-accumulate `L2_bf16 * weight` per group, ONE bf16 round per rank, then
+            // fp32-sum the per-rank results. Lane l < kNumTopk owns slot l.
             const int64_t raw_expert = lane_idx < kNumTopk
                 ? __ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + token_idx * kNumTopk + lane_idx)
                 : static_cast<int64_t>(-1);
@@ -1498,9 +1232,8 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                 ? __ldg(input_topk_weights_buffer.get_base_ptr<float>() + token_idx * kNumTopk + lane_idx)
                 : 0.0f;
 
-            // Stable sort active slots by rank: ascending rank, ascending slot within rank
-            // (matches ep_gather's ascending-topk intra-rank order + deep_ep's ascending-rank
-            // cross order). `my_pos` = this slot's index in the sorted sequence.
+            // Stable-sort active slots by (rank, slot) — matches ep_gather's intra-rank +
+            // deep_ep's cross-rank order; `my_pos` = this slot's index in the sorted sequence
             uint32_t my_pos = 0xffffffffu, base = 0;
 #pragma unroll
             for (uint32_t r = 0; r < kNumRanks; ++r) {
@@ -1511,7 +1244,7 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
             }
             const uint32_t num_active = base; // == __popc(total_mask)
 
-            // Gather per-sorted-position metadata (replicated to all lanes).
+            // Gather per-sorted-position metadata (replicated to all lanes)
             uint32_t seq_slot[kNumTopk];
             uint32_t seq_rank[kNumTopk];
             float    seq_weight[kNumTopk];
@@ -1528,8 +1261,8 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
             for (uint32_t chunk = 0; chunk < kNumChunks; ++chunk) {
                 const uint32_t chunk_byte_offset = chunk * kNumChunkBytes;
 
-                // Stream the rank-sorted sequence; TMA double-buffer flows continuously
-                // across rank-group boundaries (state is per-token, not per-group).
+                // Stream the rank-sorted sequence; the TMA double-buffer flows across
+                // rank-group boundaries (state is per-token, not per-group)
                 const auto load_pos = [&](const uint32_t& stage, const uint32_t& p) {
                     if (cute::elect_one_sync()) {
                         const auto src_ptr = math::advance_ptr<uint8_t>(
@@ -1549,7 +1282,7 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     load_pos(load_stage_idx, 0);
                     uint32_t next_p = 1, p = 0;
                     while (p < num_active) {
-                        // Intra-rank fp32 accumulator for the current rank group.
+                        // Intra-rank fp32 accumulator for the current rank group
                         float2 group_acc[kW] = {};
                         const uint32_t cur_rank = seq_rank[p];
                         while (p < num_active and seq_rank[p] == cur_rank) {
@@ -1564,11 +1297,8 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                                 for (uint32_t l = 0; l < kNumElemsPerUint4; ++l) {
                                     const float2 f2 = __bfloat1622float2(bf16_values[l]);
                                     float2& g       = group_acc[j * kNumElemsPerUint4 + l];
-                                    // FMA (1 rounding) to match ep_gather's Triton
-                                    // `accumulator += tmp.to(fp32) * acc_weight`, which the
-                                    // Triton compiler contracts to `fma.rn.f32`. (A 2-round
-                                    // `fadd∘fmul` diverges by 1 ULP only when a rank has ≥2
-                                    // experts — the source of the residual 1e-10 / 1-ULP cols.)
+                                    // NOTES: FMA matches ep_gather's Triton contraction to fma.rn.f32
+                                    // (mul+add diverges by 1 ULP when a rank has >=2 experts)
                                     g.x = __fmaf_rn(f2.x, wgt, g.x);
                                     g.y = __fmaf_rn(f2.y, wgt, g.y);
                                 }
@@ -1578,7 +1308,7 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                             ++p;
                         }
                         // Rank-group boundary: ONE bf16 round per rank, fold into the
-                        // cross-rank fp32 accumulator (ascending-rank order).
+                        // cross-rank fp32 accumulator (ascending-rank order)
 #pragma unroll
                         for (uint32_t j = 0; j < kW; ++j)
                             ptx::accumulate(cross[j], __float22bfloat162_rn(group_acc[j]));

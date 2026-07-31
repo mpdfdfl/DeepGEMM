@@ -457,13 +457,7 @@ def _run_scenario(
         buffer.topk_idx[:num_tokens].copy_(topk_idx)
         buffer.topk_weights[:num_tokens].copy_(topk_w)
         y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-        # Kernel selection: DG_SM90_MOE_KERNEL ∈ {auto(default), cooperative}
-        #   auto/cooperative -> the single N-split cooperative kernel
-        #   (BLOCK_M=64, BLOCK_N=256; the pingpong kernel was removed).
-        _kernel = os.environ.get('DG_SM90_MOE_KERNEL', 'auto')
-        _fn = {'auto': deep_gemm.fp8_mega_moe,
-               'cooperative': deep_gemm.fp8_mega_moe_cooperative}[_kernel]
-        _fn(
+        deep_gemm.fp8_mega_moe(
             y, transformed_l1, transformed_l2, buffer,
             cumulative_local_expert_recv_stats=cum_stats,
             recipe=(128, 128, 128),

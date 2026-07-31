@@ -714,12 +714,6 @@ def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
     cum_stats = torch.zeros(num_experts_per_rank + phase_profile_ints, dtype=torch.int, device='cuda')
     use_masked_hint = args.masked_ratio > 0
 
-    # Kernel selection: DG_SM90_MOE_KERNEL ∈ {auto(default), cooperative}
-    # (the pingpong kernel was removed; only the N-split cooperative kernel remains)
-    _kernel = os.environ.get('DG_SM90_MOE_KERNEL', 'auto')
-    _moe_fn = {'auto': deep_gemm.fp8_mega_moe,
-               'cooperative': deep_gemm.fp8_mega_moe_cooperative}[_kernel]
-
     # Stage inputs once; bench-loop re-copies them each call (bench helper expects
     # an idempotent ``fn``).
     def run_sm90():
@@ -732,7 +726,7 @@ def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
         if use_masked_hint:
             os.environ['DG_SM90_MOE_MASKED_HINT'] = '1'
         try:
-            _moe_fn(
+            deep_gemm.fp8_mega_moe(
                 y, transformed_l1, transformed_l2, buffer,
                 cumulative_local_expert_recv_stats=cum_stats,
                 recipe=(128, 128, 128),

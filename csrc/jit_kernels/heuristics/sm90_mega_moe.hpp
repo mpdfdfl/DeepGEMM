@@ -17,19 +17,11 @@
 
 namespace deep_gemm {
 
-// SM90 (Hopper) MegaMoE configuration
-// ----------------------------------------------------------------------------
-// SM90 differs from SM100 in:
-//   - No tensor memory (TMEM): WGMMA accumulators live in registers.
-//   - No FP4: weights are FP8 e4m3, scales are per-128 channel float.
-//   - No 2-CTA cluster MMA: TMA multicast cluster=2 may still be used.
-//   - SF for activations is float (not UE8M0 int) and per-128 (not per-32).
-// `get_mega_moe_cooperative_config_sm90` drives the single SM90 mega-MoE kernel
-// (the N-split cooperative kernel: BLOCK_M=64, BLOCK_N=256, two math warpgroups
-// split the 256-wide N tile into two 128-wide halves and share one A-tile load);
-// this config is what the SM90 host runtime reads. (The pingpong kernel and its
-// config were removed.)
-// ============================================================================
+// SM90 (Hopper) MegaMoE heuristics
+// SM90 differs from SM100 in: no TMEM (register accumulators), no FP4, no 2-CTA
+// cluster MMA, and per-128 float activation SF (not UE8M0 per-32).
+// `get_mega_moe_config_sm90` drives the single SM90 N-split kernel
+// (BLOCK_M=64, BLOCK_N=256, two math warpgroups per tile).
 
 struct MegaMoESM90Config {
     // Block tiling (no STORE_BLOCK_M / SF_BLOCK_M concept on SM90)
@@ -75,20 +67,14 @@ struct MegaMoESM90Config {
     }
 };
 
-static std::tuple<int, int> get_block_config_for_mega_moe_cooperative_sm90(
+static std::tuple<int, int> get_block_config_for_mega_moe_sm90(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& num_tokens) {
-    // N-split cooperative: fixed block_m=64 (one m64 WGMMA covers all rows) with
-    // exactly 2 math warpgroups. The two WGs process the SAME tile, splitting its
-    // BLOCK_N=256 columns into two WG_BLOCK_N=128 halves (each an m64n128 WGMMA,
-    // 64 accum-floats/thread — no register spill) and sharing one A-tile load.
-    //
-    //   12 warps = 384 threads:
-    //     HW WG0: 2 dispatch + TMA A + TMA B  → dealloc<48>
-    //     HW WG1: Math WG0 (cols 0..127)      → alloc<224>
-    //     HW WG2: Math WG1 (cols 128..255)    → alloc<224>
-    //     Register budget: 128×48 + 256×224 = 6144 + 57344 = 63488 ≤ 64512
+    // N-split: fixed block_m=64 with exactly 2 math warpgroups (each owns a
+    // 128-col half = one m64n128 WGMMA, no register spill).
+    // 12 warps = 384 threads: HW WG0 = 2 dispatch + TMA A + TMA B (dealloc<48>),
+    // HW WG1/WG2 = math WGs (alloc<224>); 128*48 + 256*224 = 63488 <= 64512.
     constexpr int block_m                = 64;
     constexpr int num_epilogue_warpgroups = 2;
 
@@ -114,7 +100,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const int& num_experts, const int& hidden,
     const int& block_m, const int& block_n, const int& block_k,
     const int& num_dispatch_warps, const int& num_epilogue_warps,
-    const int& cd_stages = 1) {
+    const int& cd_stages = 2) {
     constexpr int kSmemAlignment = 1024;
 
     // Dispatch region (same as SM100)
@@ -125,29 +111,17 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
         kSmemAlignment);
     const int smem_dispatch_size = smem_expert_count_size + smem_send_buffers_size;
 
-    // C/D output region: max of L1 FP8 (single-buffered, BLOCK_N/2 post-SwiGLU)
-    // and L2 BF16, then 1024-byte aligned (matches kernel's SMEM_CD_SIZE).
-    // The tile covers the full BLOCK_M rows; each warpgroup writes its own
-    // WG_BLOCK_M-row slice within a single staging tile.
+    // CD staging region: `cd_stages` buffers of max(L1 FP8, L2 BF16); must match
+    // the kernel's SMEM_CD_SIZE
     const int smem_cd_l1 = block_m * (block_n / 2);  // 1 byte/elem (FP8)
     const int smem_cd_l2 = block_m * block_n * static_cast<int>(sizeof(nv_bfloat16));
-    // `cd_stages` buffers (cooperative double-buffers CD to overlap the L1 store
-    // with the next tile's compute). Must match the kernel's
-    // SMEM_CD_SIZE = kNumCDStages * aligned(max(L1,L2)).
     const int smem_cd = cd_stages * align(std::max(smem_cd_l1, smem_cd_l2), kSmemAlignment);
 
-    // Cross-warpgroup per-row amax exchange (N-split): each of the 2 math WGs
-    // writes its 64-col-half per-row amax (BLOCK_M floats) so the other WG can
-    // take the max → one shared per-128 SF over the full 128 post-SwiGLU cols.
-    // Single-buffered (written then read within one tile's barrier-protected
-    // epilogue). Must match the kernel's SMEM_AMAX_SIZE.
+    // Cross-WG per-row amax exchange; must match the kernel's SMEM_AMAX_SIZE
     const int smem_amax = align(2 * block_m * static_cast<int>(sizeof(float)), kSmemAlignment);
 
-    // SF on SM90:
-    //   * SFA per stage holds BLOCK_M floats: both L1 and L2 are per-128 K, so a
-    //     single BLOCK_K=128 tile maps to exactly one SF group per row.
-    //   * SFB is loaded directly from global by the math warpgroup (block-(128,128)
-    //     weight quantization), so no SMEM is reserved for it.
+    // SFA per stage = BLOCK_M floats (one per-128 group per row); SFB is loaded
+    // directly from global by the math warpgroups, no SMEM
     const int smem_sfa_per_stage = align(block_m * static_cast<int>(sizeof(float)), 128);
     const int smem_sfb_per_stage = 0;
 
@@ -159,7 +133,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     //   * dispatch: num_dispatch_warps
     //   * GEMM full + empty: 2 * num_stages
     //   * combine: 2 * num_epilogue_warps
-    //   * pingpong order: 4 (OrderedSequenceBarrier<2,2>)
+    //   * order (reserved for L2 pingpong): 4
     const int smem_barriers_fixed = (num_dispatch_warps + 2 * num_epilogue_warps + 4) * 8;
     const int smem_barriers_per_stage = 2 * 8;
 
@@ -174,24 +148,19 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
             smem_fixed + num_stages * (smem_per_stage + smem_barriers_per_stage)};
 }
 
-// SM90 mega-MoE config: the single N-split cooperative kernel (block_m=64,
-// block_n=256). CD is double-buffered (cd_stages=2) to overlap the L1 store with
-// the next tile's compute.
-static MegaMoESM90Config get_mega_moe_cooperative_config_sm90(
+// SM90 mega-MoE config for the single N-split kernel (block_m=64, block_n=256);
+// CD is double-buffered (cd_stages=2) to overlap the L1 store with compute
+static MegaMoESM90Config get_mega_moe_config_sm90(
     const int& num_ranks, const int& num_experts, const int& num_experts_per_rank,
     const int& num_max_tokens_per_rank, const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const int& num_padded_sf_pool_tokens) {
-    const auto [block_m, num_epilogue_threads] = get_block_config_for_mega_moe_cooperative_sm90(
+    const auto [block_m, num_epilogue_threads] = get_block_config_for_mega_moe_sm90(
         num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens);
-    // N-split: BLOCK_N=256 so one L1 block emits 128 post-SwiGLU columns (= one
-    // per-128 SF group). The two math warpgroups split it into two 128-wide
-    // halves (each an m64n128 WGMMA).
+    // BLOCK_N=256: one L1 block emits 128 post-SwiGLU columns (= one per-128 SF group)
     const int block_n = 256;
     const int block_k = 128;
-    // cluster_size=1: single-CTA. The per-128 SF amax is reduced across the two
-    // math warpgroups within this CTA (see the kernel L1 epilogue), so no
-    // cross-CTA synchronisation is needed.
+    // cluster_size=1: the per-128 amax reduction is intra-CTA (across the 2 math WGs)
     const int cluster_size = 1;
     const int num_max_pool_tokens = layout::get_num_max_pool_tokens(
         num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
@@ -237,7 +206,7 @@ static MegaMoESM90Config get_mega_moe_cooperative_config_sm90(
 
     if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
         const auto key = fmt::format(
-            "MegaMoESM90Config(cooperative, num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={})",
+            "MegaMoESM90Config(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={})",
             num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk);
         static std::unordered_set<std::string> printed;
         if (printed.count(key) == 0) {
