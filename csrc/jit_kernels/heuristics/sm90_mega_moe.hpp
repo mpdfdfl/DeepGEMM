@@ -50,6 +50,9 @@ struct MegaMoESM90Config {
     // Thread layout: dispatch + non-epilogue (TMA) + epilogue (math)
     int num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads;
 
+    // Dispatch pull chunk size in bytes (<= 4096, divides hidden)
+    int num_bytes_per_pull;
+
     friend std::ostream& operator << (std::ostream& os, const MegaMoESM90Config& config) {
         os << "MegaMoESM90Config("
            << "block_m=" << config.block_m << ", block_n=" << config.block_n << ", block_k=" << config.block_k
@@ -62,7 +65,8 @@ struct MegaMoESM90Config {
            << ", num_stages=" << config.num_stages << ", smem_size=" << config.smem_size
            << ", num_dispatch_threads=" << config.num_dispatch_threads
            << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
-           << ", num_epilogue_threads=" << config.num_epilogue_threads << ")";
+           << ", num_epilogue_threads=" << config.num_epilogue_threads
+           << ", num_bytes_per_pull=" << config.num_bytes_per_pull << ")";
         return os;
     }
 };
@@ -99,15 +103,16 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const int& smem_capacity,
     const int& num_experts, const int& hidden,
     const int& block_m, const int& block_n, const int& block_k,
+    const int& num_bytes_per_pull,
     const int& num_dispatch_warps, const int& num_epilogue_warps,
     const int& cd_stages = 2) {
     constexpr int kSmemAlignment = 1024;
 
-    // Dispatch region (same as SM100)
+    // Dispatch region (same as SM100): per-warp send buffers hold one pull chunk
     const int smem_expert_count_size = align(
         num_experts * static_cast<int>(sizeof(uint32_t)), kSmemAlignment);
     const int smem_send_buffers_size = align(
-        static_cast<int>(layout::Buffer(layout::Data(hidden), num_dispatch_warps, 1).get_num_bytes()),
+        static_cast<int>(layout::Buffer(layout::Data(num_bytes_per_pull), num_dispatch_warps, 1).get_num_bytes()),
         kSmemAlignment);
     const int smem_dispatch_size = smem_expert_count_size + smem_send_buffers_size;
 
@@ -186,10 +191,19 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
                                         ? (tokens_per_expert >= 256.0f)
                                         : (nmajor_override != 0);
 
+    // Pull: divide token bytes by 2 until <= kPullThreshold (same as SM100)
+    constexpr int kPullThreshold = 4096;
+    int num_bytes_per_pull = hidden;
+    while (num_bytes_per_pull > kPullThreshold) {
+        DG_HOST_ASSERT(num_bytes_per_pull % 2 == 0);
+        num_bytes_per_pull /= 2;
+    }
+
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90(
         SM90ArchSpec::smem_capacity,
         num_experts, hidden,
         block_m, block_n, block_k,
+        num_bytes_per_pull,
         num_dispatch_threads / 32, num_epilogue_threads / 32,
         /*cd_stages=*/2);
 
@@ -201,7 +215,8 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
         num_experts_per_wave,
         l2_nmajor_schedule,
         num_stages, smem_size,
-        num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads
+        num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads,
+        num_bytes_per_pull
     };
 
     if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {

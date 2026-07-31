@@ -40,6 +40,7 @@ template <
     uint32_t kNumMaxPoolTokens,
     uint32_t kNumPaddedSFPoolTokens,
     uint32_t kNumStages,
+    uint32_t kNumBytesPerPull,
     uint32_t kNumDispatchThreads, uint32_t kNumNonEpilogueThreads,
     uint32_t kNumEpilogueThreads,
     uint32_t kNumSMs, uint32_t kNumRanks,
@@ -161,8 +162,11 @@ sm90_fp8_mega_moe_impl(void* y,
 
     constexpr uint32_t SMEM_EXPERT_COUNT_SIZE =
         math::constexpr_align<uint32_t>(kNumExperts * sizeof(uint32_t), kSharedMemoryAlignment);
+    // Per-warp send buffers hold one pull chunk (not the full token)
+    constexpr auto pull_layout = layout::Data(kNumBytesPerPull);
+    DG_STATIC_ASSERT(kHidden % kNumBytesPerPull == 0, "kNumBytesPerPull must divide hidden");
     constexpr uint32_t SMEM_SEND_BUFFER_SIZE =
-        math::constexpr_align(fp8_token_layout.get_num_bytes() * kNumDispatchWarps, kSharedMemoryAlignment);
+        math::constexpr_align(pull_layout.get_num_bytes() * kNumDispatchWarps, kSharedMemoryAlignment);
     constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(a_dtype_t);
     constexpr uint32_t SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
     // SFA per-stage: one BLOCK_K=128 tile maps to exactly one per-128 SF group per row
@@ -194,7 +198,7 @@ sm90_fp8_mega_moe_impl(void* y,
     // SMEM pointers
     auto smem_expert_count       = reinterpret_cast<uint32_t*>(smem_buffer);
     const auto smem_send_buffers = layout::Buffer(
-        fp8_token_layout, kNumDispatchWarps, 1,
+        pull_layout, kNumDispatchWarps, 1,
         math::advance_ptr(smem_buffer, SMEM_EXPERT_COUNT_SIZE));
 
     auto smem_gemm_base = math::advance_ptr(
@@ -489,51 +493,63 @@ sm90_fp8_mega_moe_impl(void* y,
             const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;
             const uint32_t src_topk_idx  = src_token_topk_idx % kNumTopk;
 
-            // TMA pull token data into SMEM
+            // Hidden bytes are divided into chunks (single-buffered pull chunk per warp)
+            constexpr uint32_t kNumChunks = kHidden / kNumBytesPerPull;
+
+            // TMA load token from remote rank and store into local, chunk by chunk
+            const uint32_t pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
+            const auto src_base_ptr       = sym_buffer.map(
+                input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(),
+                current_rank_in_expert_idx);
+            const auto dst_base_ptr = l1_token_buffer.get_data_buffer(pool_token_idx).get_base_ptr();
+            const auto issue_and_wait_pull_store = [&](const uint32_t& i) {
+                ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
+                ptx::tma_store_1d(
+                    math::advance_ptr(dst_base_ptr, i * kNumBytesPerPull),
+                    pull_buffer.get_base_ptr(), kNumBytesPerPull);
+                cute::tma_store_arrive();
+                ptx::tma_store_wait<0>();
+            };
             if (cute::elect_one_sync()) {
-                ptx::tma_load_1d(
-                    pull_buffer.get_base_ptr(),
-                    sym_buffer.map(input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(),
-                                   current_rank_in_expert_idx),
-                    pull_mbarrier, kHidden);
+#pragma unroll
+                for (uint32_t i = 0; i < kNumChunks; ++i) {
+                    ptx::tma_load_1d(
+                        pull_buffer.get_base_ptr(),
+                        math::advance_ptr(src_base_ptr, i * kNumBytesPerPull),
+                        pull_mbarrier, kNumBytesPerPull);
+                    ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kNumBytesPerPull);
+                    i != (kNumChunks - 1) ? issue_and_wait_pull_store(i) : void();
+                }
             }
             __syncwarp();
 
-            // Copy SF: per-128 K floats, written linearly (no UTCCP transpose).
+            // Copy SF (overlaps with the last chunk's TMA load from remote):
+            // per-128 K floats written linearly (no UTCCP transpose)
             constexpr uint32_t kNumSFFloats = kHidden / 128;
             DG_STATIC_ASSERT(kNumSFFloats > 0 and kHidden % 128 == 0, "Invalid SF");
             const auto remote_sf_ptr = sym_buffer.map(
                 input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>(),
                 current_rank_in_expert_idx);
-            const auto local_sf_ptr          = l1_sf_buffer.get_base_ptr<float>();
-            const uint32_t sf_pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
+            const auto local_sf_ptr = l1_sf_buffer.get_base_ptr<float>();
 #pragma unroll
             for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFFloats, 32u); ++i) {
                 const uint32_t j = i * 32 + lane_idx;
                 if (j < kNumSFFloats)
-                    local_sf_ptr[j * kNumPaddedSFPoolTokens + sf_pool_token_idx] = remote_sf_ptr[j];
+                    local_sf_ptr[j * kNumPaddedSFPoolTokens + pool_token_idx] = remote_sf_ptr[j];
             }
             __syncwarp();
 
-            const uint32_t pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
+            // Store weights and metadata, then complete the last chunk's store
             if (cute::elect_one_sync()) {
                 const auto weight = *sym_buffer.map(
                     input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
                     current_rank_in_expert_idx);
                 *l1_topk_weights_buffer.get_data_buffer(pool_token_idx).get_base_ptr<float>() = weight;
 
-                ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kHidden);
-                ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
-
-                ptx::tma_store_1d(
-                    l1_token_buffer.get_data_buffer(pool_token_idx).get_base_ptr(),
-                    pull_buffer.get_base_ptr(), pull_buffer.get_num_bytes());
-
                 *workspace.get_token_src_metadata_ptr(pool_token_idx) =
                     {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
 
-                cute::tma_store_arrive();
-                ptx::tma_store_wait<0>();
+                issue_and_wait_pull_store(kNumChunks - 1);
                 ptx::red_add_rel(
                     workspace.get_l1_arrival_count_ptr(expert_pool_block_offset + token_idx_in_expert / BLOCK_M), 1);
             }

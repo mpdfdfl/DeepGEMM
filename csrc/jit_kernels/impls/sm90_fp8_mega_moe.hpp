@@ -57,8 +57,9 @@ public:
 
     static std::string generate_impl(const Args& args) {
         return fmt::format(R"(
-// JIT cache key: sm90_mega_moe_v30 (renamed from cooperative_v29; see git log for
-// the full numerics-alignment history — the kernel is bit-exact vs sglang DeepEP).
+// JIT cache key: sm90_mega_moe_v31 (v30: renamed from cooperative_v29, see git log
+// for the numerics history — bit-exact vs sglang DeepEP; v31: chunked dispatch pull,
+// kNumBytesPerPull <= 4096, aligned with SM100).
 // Trap-only asserts / no printf: vprintf causes ptxas C7510 (serialized WGMMA).
 #define DG_DEVICE_ASSERT(cond) do {{ if (not (cond)) asm("trap;"); }} while (0)
 #define DG_NO_DEVICE_PRINTF
@@ -73,6 +74,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {}, {}, {},
+        {},
         {},
         {},
         {},
@@ -91,6 +93,7 @@ static void __instantiate_kernel() {{
     args.config.num_max_pool_tokens,
     args.config.num_padded_sf_pool_tokens,
     args.config.num_stages,
+    args.config.num_bytes_per_pull,
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
