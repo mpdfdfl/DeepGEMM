@@ -47,6 +47,7 @@ template <
     float kActivationClamp,
     bool kFastMath,
     bool kL2NMajorSchedule,
+    bool kL2Pingpong,
     uint32_t L1_SHAPE_N              = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K              = kHidden,
     uint32_t L2_SHAPE_N              = kHidden,
@@ -151,6 +152,11 @@ sm90_fp8_mega_moe_impl(void* y,
     constexpr uint32_t LOAD_BLOCK_M   = BLOCK_M;                     // 64
     constexpr uint32_t LOAD_BLOCK_N   = BLOCK_N;                     // 256
     constexpr uint32_t L1_OUT_BLOCK_N = BLOCK_N / 2;                 // 128 post-SwiGLU (one per-128 SF group)
+    // L2 pingpong: L2 tiles narrow to 128 and each is owned exclusively by one math
+    // WG (tile parity), so a WG's NVLink scatter overlaps the other WG's WGMMA.
+    // B is still loaded 256-wide at 256-aligned n (the owner reads its 128-col half),
+    // so the B loader is unchanged; L2 A/B HBM traffic doubles (accepted cost).
+    constexpr uint32_t BLOCK_N_L2     = kL2Pingpong ? WG_BLOCK_N : BLOCK_N;
     constexpr uint32_t kSwizzleAMode  = BLOCK_K * sizeof(a_dtype_t); // 128
     constexpr uint32_t kSwizzleBMode  = BLOCK_K * sizeof(b_dtype_t); // 128
     constexpr uint32_t kGranK         = 128; // L1 acts SF, weights SF
@@ -181,7 +187,7 @@ sm90_fp8_mega_moe_impl(void* y,
     // fills the other buffer (the host pipeline config accounts for the 2x CD region).
     constexpr uint32_t kNumCDStages     = 2;
     constexpr uint32_t SMEM_CD_L1_SIZE  = BLOCK_M * L1_OUT_BLOCK_N * sizeof(cutlass::float_e4m3_t);
-    constexpr uint32_t SMEM_CD_L2_SIZE  = BLOCK_M * BLOCK_N * sizeof(nv_bfloat16);
+    constexpr uint32_t SMEM_CD_L2_SIZE  = BLOCK_M * BLOCK_N_L2 * sizeof(nv_bfloat16);
     constexpr uint32_t SMEM_CD_BUF_SIZE = math::constexpr_align(
         SMEM_CD_L1_SIZE > SMEM_CD_L2_SIZE ? SMEM_CD_L1_SIZE : SMEM_CD_L2_SIZE, kSharedMemoryAlignment);
     constexpr uint32_t SMEM_CD_SIZE = kNumCDStages * SMEM_CD_BUF_SIZE;
@@ -293,7 +299,8 @@ sm90_fp8_mega_moe_impl(void* y,
         L1_SHAPE_N, L1_SHAPE_K,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank, kNumExpertsPerWave,
-        kNumSMs, kNumRanks, /*kClusterSize=*/1u, kL2NMajorSchedule>(workspace);
+        kNumSMs, kNumRanks, /*kClusterSize=*/1u, kL2NMajorSchedule,
+        BLOCK_N_L2>(workspace);
 
     // Pipeline state shared by TMA loaders and math warpgroups
     uint32_t stage_idx = 0, phase = 0;
@@ -690,7 +697,12 @@ sm90_fp8_mega_moe_impl(void* y,
                 empty_barriers[stage_idx]->wait(phase ^ 1);
 
                 if (cute::elect_one_sync()) {
-                    const uint32_t n_idx = local_expert_idx * shape_n + n_block_idx * BLOCK_N;
+                    // L2 pingpong: n_block_idx is in BLOCK_N_L2=128 units; B is loaded as
+                    // the 256-aligned covering block (the owner WG reads its 128-col half)
+                    const uint32_t n_block_256 = block_phase == sched::BlockPhase::Linear2
+                                                     ? (n_block_idx * BLOCK_N_L2) / BLOCK_N
+                                                     : n_block_idx;
+                    const uint32_t n_idx = local_expert_idx * shape_n + n_block_256 * BLOCK_N;
                     const uint32_t k_idx = k_block_idx * BLOCK_K;
 
                     // TMA load B (weight SF is loaded by math warps directly from global)
@@ -746,6 +758,8 @@ sm90_fp8_mega_moe_impl(void* y,
         bool l1_store_pending              = false;
         uint32_t l1_pending_pool_block_idx = 0;
         uint32_t l1_pending_n_block_idx    = 0;
+        // Pingpong: tracks the L2 -> next-wave-L1 boundary (see the rendezvous below)
+        bool prev_was_l2 = false;
         while (true) {
             CUTE_TIE_DECL(scheduler.get_next_block(), block_phase, local_expert_idx, m_block_idx, n_block_idx);
             if (block_phase == sched::BlockPhase::None)
@@ -754,16 +768,18 @@ sm90_fp8_mega_moe_impl(void* y,
                                           ? L2_SHAPE_K / BLOCK_K
                                           : L1_SHAPE_K / BLOCK_K;
 
-            // Both WGs process every tile, each handling its own column half
+            // Both WGs process every tile, each handling its own column half (except
+            // pingpong L2 tiles, owned exclusively by one WG — see below)
             const uint32_t valid_m        = scheduler.template get_valid_m<false>();
             const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
             const uint32_t m_idx          = pool_block_idx * BLOCK_M;
             // Alternate CD buffer per tile so the previous L1 store drains in the background
             const uint32_t cd_buf = pos % kNumCDStages;
-            const uint32_t n_idx  = n_block_idx * BLOCK_N;
+            const uint32_t n_idx  = n_block_idx * (block_phase == sched::BlockPhase::Linear2 ? BLOCK_N_L2 : BLOCK_N);
 
             // L1->L2 transition: flush the deferred L1 store so its mask bit is
-            // published before any L2 loader spins on it
+            // published before any L2 loader spins on it. NOTES: this 256-thread sync
+            // runs BEFORE the pingpong ownership fork, so both WGs always reach it
             if (block_phase == sched::BlockPhase::Linear2 and l1_store_pending) {
                 ptx::tma_store_wait<0>();
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
@@ -773,6 +789,24 @@ sm90_fp8_mega_moe_impl(void* y,
                         1ull << l1_pending_n_block_idx);
                 }
                 l1_store_pending = false;
+            }
+
+            // L2 -> next wave L1 rendezvous: the WGs may be tiles apart at the end of a
+            // pingpong L2 phase, and the L1 CD buffers (pos % 2) alias the per-WG L2 CD
+            // buffers in raw bytes — so a WG must not start writing L1 CD while the
+            // other still scatters its last owned L2 tile
+            if (kL2Pingpong and block_phase == sched::BlockPhase::Linear1 and prev_was_l2)
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+            prev_was_l2 = block_phase == sched::BlockPhase::Linear2;
+
+            // Pingpong: L2 tiles alternate owners by tile parity; the non-owner
+            // fast-forwards its pipeline state without waiting full or arriving empty
+            if (kL2Pingpong and block_phase == sched::BlockPhase::Linear2 and
+                (pos & 1u) != epilogue_wg_idx) {
+                for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx))
+                    ;
+                ++pos;
+                continue;
             }
 
             // GEMM (MMA region)
@@ -785,14 +819,21 @@ sm90_fp8_mega_moe_impl(void* y,
             // L1 SF shape (E, 2*IH/128, H/128) MN-major; the gate/up gran-8 interleave
             // keeps a 256-wide tile inside ONE gate + ONE up SF block shared by both WGs:
             // gate_sf_n = n_block_idx, up_sf_n = IH/128 + n_block_idx.
-            // L2 SF shape (E, H/128, IH/128) MN-major; a 256-wide tile spans two blocks,
-            // WG g owns SF block n_block_idx*2 + g.
+            // L2 SF shape (E, H/128, IH/128) MN-major, one block per 128 output cols:
+            // pingpong tiles are 128 wide (block = n_block_idx); otherwise a 256-wide
+            // tile spans two blocks and WG g owns block n_block_idx*2 + g.
             constexpr uint32_t kL1SFKBlocks   = kHidden / 128;
             constexpr uint32_t kL2SFKBlocks   = kIntermediateHidden / 128;
             constexpr uint32_t kL1SFGateBlks  = kIntermediateHidden / 128;
             constexpr uint32_t kL1SFPerExpert = (kIntermediateHidden * 2 / 128) * kL1SFKBlocks;
             constexpr uint32_t kL2SFPerExpert = (kHidden / 128) * kL2SFKBlocks;
-            const uint32_t l2_sf_n_block = n_block_idx * 2u + epilogue_wg_idx;
+            const uint32_t l2_sf_n_block = kL2Pingpong ? n_block_idx
+                                                       : n_block_idx * 2u + epilogue_wg_idx;
+
+            // B column offset into the 256-wide stage for L2: pingpong owner reads its
+            // tile's half of the 256-aligned covering block; otherwise this WG's half
+            const uint32_t l2_b_col_off = kL2Pingpong ? (n_block_idx & 1u) * WG_BLOCK_N * BLOCK_K
+                                                      : b_col_off;
 
             // Weight SF software pipelining: prefetch k=0 before the loop, each iteration
             // then prefetches the next k after WGMMA (~200-cycle __ldg off the critical path)
@@ -881,7 +922,7 @@ sm90_fp8_mega_moe_impl(void* y,
                         auto desc_a = mma::sm90::make_smem_desc(
                             smem_a[stage_idx] + a_row_off + k * WGMMA::K, 1);
                         auto desc_b = mma::sm90::make_smem_desc(
-                            smem_b[stage_idx] + b_col_off + k * WGMMA::K, 1);
+                            smem_b[stage_idx] + l2_b_col_off + k * WGMMA::K, 1);
                         WGMMA::wgmma(desc_a, desc_b, accum, k);
                     }
                     ptx::warpgroup_commit_batch();
@@ -895,8 +936,14 @@ sm90_fp8_mega_moe_impl(void* y,
                         ptx::warpgroup_fence_operand(accum[i]);
                     ptx::warpgroup_wait<0>();
 
-                    if (lane_idx == 0)
-                        empty_barriers[stage_idx]->arrive();
+                    if (lane_idx == 0) {
+                        // Pingpong: only the owner WG's 4 warps release the stage, so each
+                        // arrives with count 2 to keep the empty-barrier init count of 8
+                        if constexpr (kL2Pingpong)
+                            ptx::mbarrier_arrive(empty_barriers[stage_idx], 2u);
+                        else
+                            empty_barriers[stage_idx]->arrive();
+                    }
 
                     // Prefetch the next k-block's weight SF
                     const float cur_l2_sf = l2_sf;
@@ -1101,9 +1148,12 @@ sm90_fp8_mega_moe_impl(void* y,
                 l1_pending_pool_block_idx = pool_block_idx;
                 l1_pending_n_block_idx    = n_block_idx;
             } else {
-                // L2 epilogue: BF16 cast + NVLink scatter; each WG writes and scatters its
-                // own 128-col half (disjoint destination columns)
+                // L2 epilogue: BF16 cast + NVLink scatter. Pingpong: the owner WG covers
+                // the whole 128-wide tile using its private CD buffer; otherwise each WG
+                // writes/scatters its 128-col half of the shared 256-wide tile
                 constexpr uint32_t kNumRowsPerWarp = BLOCK_M / 8;
+                const uint32_t cd_l2_buf  = kL2Pingpong ? epilogue_wg_idx : cd_buf;
+                const uint32_t l2_col_off = kL2Pingpong ? 0u : col_block_offset;
 
                 // NOTES: scatter the RAW (unweighted) bf16 L2 output — sglang applies the
                 // topk weight only at combine (see the two-layer combine below)
@@ -1122,9 +1172,8 @@ sm90_fp8_mega_moe_impl(void* y,
                     const uint32_t r1_hi = math::cast_into_bf16_and_pack(
                         final_accum[chunk_hi * 4 + 2], final_accum[chunk_hi * 4 + 3]);
 
-                    // Write to SMEM at this WG's column half (rows shared across WGs)
                     auto write_pair = [&](uint32_t row, uint32_t col, uint32_t packed) {
-                        auto smem_ptr = smem_cd_l2[cd_buf] + row * BLOCK_N + col_block_offset + col;
+                        auto smem_ptr = smem_cd_l2[cd_l2_buf] + row * BLOCK_N_L2 + l2_col_off + col;
                         *reinterpret_cast<uint32_t*>(smem_ptr) = packed;
                     };
                     write_pair(r_0, chunk_lo * 8 + col_idx * 2, r0_lo);
@@ -1135,7 +1184,7 @@ sm90_fp8_mega_moe_impl(void* y,
 
                 ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
-                // NVLink scatter: 16 lanes per row, each lane 8 cols (1 uint4) of this WG's half
+                // NVLink scatter: 16 lanes per row, each lane 8 cols (1 uint4)
                 const uint32_t row_in_warp_block = lane_idx / 16; // 0 or 1
                 const uint32_t lane_in_row       = lane_idx % 16;
                 const uint32_t cols_per_lane     = WG_BLOCK_N / 16; // 8 cols per lane
@@ -1152,24 +1201,31 @@ sm90_fp8_mega_moe_impl(void* y,
                     const uint32_t dst_token_idx = src_metadata.token_idx;
                     const uint32_t dst_topk_idx  = src_metadata.topk_idx;
 
-                    // Read 8 BF16s (1 uint4) from this WG's half
-                    auto smem_ptr     = smem_cd_l2[cd_buf] + tile_row * BLOCK_N + col_block_offset + lane_in_row * cols_per_lane;
+                    // Read 8 BF16s (1 uint4) from SMEM
+                    auto smem_ptr     = smem_cd_l2[cd_l2_buf] + tile_row * BLOCK_N_L2 + l2_col_off + lane_in_row * cols_per_lane;
                     const auto packed = *reinterpret_cast<uint4*>(smem_ptr);
 
-                    // Write to remote at this WG's destination column offset
+                    // Write to remote at the destination column offset
                     const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)
                                                .get_data_buffer(dst_token_idx);
                     auto dst_ptr         = math::advance_ptr<uint4>(
                         dst_token.get_base_ptr(),
-                        (n_idx + col_block_offset) * sizeof(nv_bfloat16) + lane_in_row * sizeof(uint4));
+                        (n_idx + l2_col_off) * sizeof(nv_bfloat16) + lane_in_row * sizeof(uint4));
                     *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
                 }
 
-                // Tile-boundary 256-thread rendezvous: without it a WG can start writing the
-                // NEXT tile's smem_cd while the other still scatters THIS tile (the FP8/BF16
-                // layouts alias in raw bytes). L1 runs the symmetric barrier once per tile,
-                // so the arrival counts stay consistent and cannot deadlock
-                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                if constexpr (kL2Pingpong) {
+                    // Owner-only path (no 256-thread sync allowed — the other WG skips this
+                    // tile): a per-WG barrier orders this tile's scatter reads before the
+                    // WG's next owned tile overwrites its private CD buffer
+                    ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+                } else {
+                    // Tile-boundary 256-thread rendezvous: without it a WG can start writing
+                    // the NEXT tile's smem_cd while the other still scatters THIS tile (the
+                    // FP8/BF16 layouts alias in raw bytes). L1 runs the symmetric barrier
+                    // once per tile, so the arrival counts stay consistent
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                }
             }
             ++pos;
         }
