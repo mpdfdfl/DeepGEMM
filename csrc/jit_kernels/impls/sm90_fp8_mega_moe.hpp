@@ -57,10 +57,10 @@ public:
 
     static std::string generate_impl(const Args& args) {
         return fmt::format(R"(
-// JIT cache key: sm90_mega_moe_v33 (v30: renamed from cooperative_v29, see git log
+// JIT cache key: sm90_mega_moe_v34 (v30: renamed from cooperative_v29, see git log
 // for the numerics history — bit-exact vs sglang DeepEP; v31: chunked dispatch pull;
-// v32: L2 pingpong; v33: pingpong non-owner participates in full/empty instead of
-// fast-forwarding — a local-only skip aliases the mbarrier parity wait and hangs).
+// v34: per-stage SMEM SFB slots filled by the B loader (no math-WG global SF reads);
+// the L2 pingpong experiment (v32/v33) is removed).
 // Trap-only asserts / no printf: vprintf causes ptxas C7510 (serialized WGMMA).
 #define DG_DEVICE_ASSERT(cond) do {{ if (not (cond)) asm("trap;"); }} while (0)
 #define DG_NO_DEVICE_PRINTF
@@ -82,7 +82,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {},
-        {}, {}, {}
+        {}, {}
     >);
 }};
 )",
@@ -99,8 +99,7 @@ static void __instantiate_kernel() {{
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
-    args.config.l2_nmajor_schedule ? "true" : "false",
-    args.config.l2_pingpong ? "true" : "false");
+    args.config.l2_nmajor_schedule ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {

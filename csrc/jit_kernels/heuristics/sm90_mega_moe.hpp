@@ -44,10 +44,6 @@ struct MegaMoESM90Config {
     // sweeping m) — enabled at large tokens-per-expert to cut weight L2 thrash.
     bool l2_nmajor_schedule;
 
-    // L2 pingpong: 128-wide L2 tiles owned exclusively by alternating math WGs,
-    // overlapping one WG's NVLink scatter with the other's WGMMA
-    bool l2_pingpong;
-
     // Pipeline stages and shared memory
     int num_stages, smem_size;
 
@@ -66,7 +62,6 @@ struct MegaMoESM90Config {
            << ", swizzle_acts_mode=" << config.swizzle_acts_mode << ", swizzle_weights_mode=" << config.swizzle_weights_mode
            << ", num_experts_per_wave=" << config.num_experts_per_wave
            << ", l2_nmajor_schedule=" << config.l2_nmajor_schedule
-           << ", l2_pingpong=" << config.l2_pingpong
            << ", num_stages=" << config.num_stages << ", smem_size=" << config.smem_size
            << ", num_dispatch_threads=" << config.num_dispatch_threads
            << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
@@ -110,7 +105,6 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const int& block_m, const int& block_n, const int& block_k,
     const int& num_bytes_per_pull,
     const int& num_dispatch_warps, const int& num_epilogue_warps,
-    const bool& l2_pingpong,
     const int& cd_stages = 2) {
     constexpr int kSmemAlignment = 1024;
 
@@ -123,9 +117,9 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const int smem_dispatch_size = smem_expert_count_size + smem_send_buffers_size;
 
     // CD staging region: `cd_stages` buffers of max(L1 FP8, L2 BF16); must match
-    // the kernel's SMEM_CD_SIZE. L2 pingpong halves the L2 staging tile (128 wide)
+    // the kernel's SMEM_CD_SIZE
     const int smem_cd_l1 = block_m * (block_n / 2);  // 1 byte/elem (FP8)
-    const int smem_cd_l2 = block_m * (l2_pingpong ? block_n / 2 : block_n) * static_cast<int>(sizeof(nv_bfloat16));
+    const int smem_cd_l2 = block_m * block_n * static_cast<int>(sizeof(nv_bfloat16));
     const int smem_cd = cd_stages * align(std::max(smem_cd_l1, smem_cd_l2), kSmemAlignment);
 
     // Cross-WG per-row amax exchange; must match the kernel's SMEM_AMAX_SIZE
@@ -145,8 +139,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     //   * dispatch: num_dispatch_warps
     //   * GEMM full + empty: 2 * num_stages
     //   * combine: 2 * num_epilogue_warps
-    //   * order (reserved for L2 pingpong): 4
-    const int smem_barriers_fixed = (num_dispatch_warps + 2 * num_epilogue_warps + 4) * 8;
+    const int smem_barriers_fixed = (num_dispatch_warps + 2 * num_epilogue_warps) * 8;
     const int smem_barriers_per_stage = 2 * 8;
 
     // Fixed total
@@ -198,10 +191,6 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
                                         ? (tokens_per_expert >= 256.0f)
                                         : (nmajor_override != 0);
 
-    // L2 pingpong (A/B switch, default on): DG_SM90_MOE_L2_PINGPONG=0 reverts to the
-    // shared-tile L2 path
-    const bool l2_pingpong = get_env<int>("DG_SM90_MOE_L2_PINGPONG", 1) != 0;
-
     // Pull: divide token bytes by 2 until <= kPullThreshold (same as SM100)
     constexpr int kPullThreshold = 4096;
     int num_bytes_per_pull = hidden;
@@ -216,7 +205,6 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
         block_m, block_n, block_k,
         num_bytes_per_pull,
         num_dispatch_threads / 32, num_epilogue_threads / 32,
-        l2_pingpong,
         /*cd_stages=*/2);
 
     const auto config = MegaMoESM90Config {
@@ -226,7 +214,6 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
         swizzle_acts_mode, swizzle_weights_mode,
         num_experts_per_wave,
         l2_nmajor_schedule,
-        l2_pingpong,
         num_stages, smem_size,
         num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads,
         num_bytes_per_pull
