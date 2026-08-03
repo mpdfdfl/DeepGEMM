@@ -178,8 +178,25 @@ sm90_fp8_mega_moe_impl(void* y,
     // SFA per-stage: one BLOCK_K=128 tile maps to exactly one per-128 SF group per row
     constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE =
         math::constexpr_align<uint32_t>(BLOCK_M * sizeof(float), 128u);
-    // Block (128, 128) weight SF is loaded by the math WGs directly from global, no SMEM
-    constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = 0;
+    // Per-stage weight SF slots (2 floats), filled by the B loader right next to its
+    // B-tile TMA and published through the SAME full/empty protocol (mbarrier arrive
+    // has release semantics; the consumer's full-wait has acquire) — so the math
+    // warps never touch global memory for weight SF. Slot meaning per phase:
+    //   L1:          slot0 = gate_sf[k], slot1 = up_sf[k]         (shared by both WGs)
+    //   L2 coop:     slot g = SF of 128-col block n*2+g           (WG g reads slot g)
+    //   L2 pingpong: slots = SF of the 256-aligned covering pair  (owner reads n&1)
+    constexpr uint32_t kNumSFBSlotsPerStage    = 2;
+    constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = kNumSFBSlotsPerStage * sizeof(float);
+
+    // Weight SF layout constants (block (128, 128) scales, MN-major).
+    // L1 SF shape (E, 2*IH/128, H/128); the gate/up gran-8 interleave keeps a 256-wide
+    // tile inside ONE gate + ONE up SF block shared by both WGs.
+    // L2 SF shape (E, H/128, IH/128), one block per 128 output cols.
+    constexpr uint32_t kL1SFKBlocks   = kHidden / 128;
+    constexpr uint32_t kL2SFKBlocks   = kIntermediateHidden / 128;
+    constexpr uint32_t kL1SFGateBlks  = kIntermediateHidden / 128;
+    constexpr uint32_t kL1SFPerExpert = (kIntermediateHidden * 2 / 128) * kL1SFKBlocks;
+    constexpr uint32_t kL2SFPerExpert = (kHidden / 128) * kL2SFKBlocks;
 
     // CD staging: max of L1 FP8 (BLOCK_M x L1_OUT_BLOCK_N) and L2 BF16 (BLOCK_M x BLOCK_N);
     // each WG writes its own 128-col half of a single full tile.
@@ -238,11 +255,16 @@ sm90_fp8_mega_moe_impl(void* y,
     auto smem_sfa                       = utils::PatternVisitor([=](const uint32_t& i) {
         return reinterpret_cast<float*>(sf_start_ptr + i * SMEM_SFA_SIZE_PER_STAGE);
     });
+    // Per-stage weight SF slots (see SMEM_SFB_SIZE_PER_STAGE above)
+    auto smem_sfb                       = utils::PatternVisitor([=](const uint32_t& i) {
+        return reinterpret_cast<float*>(sf_start_ptr + kNumStages * SMEM_SFA_SIZE_PER_STAGE) +
+               i * kNumSFBSlotsPerStage;
+    });
 
     // Barrier layout: dispatch | full | empty | combine | order
     // NOTES: order_barriers are reserved for the L2 pingpong path (unused for now)
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(
-        sf_start_ptr + kNumStages * SMEM_SFA_SIZE_PER_STAGE);
+        sf_start_ptr + kNumStages * (SMEM_SFA_SIZE_PER_STAGE + SMEM_SFB_SIZE_PER_STAGE));
     auto dispatch_barriers = utils::PatternVisitor([=](const uint32_t& i) {
         return barrier_start_ptr + i;
     });
@@ -693,6 +715,22 @@ sm90_fp8_mega_moe_impl(void* y,
 
             const uint32_t shape_n = block_phase == sched::BlockPhase::Linear2 ? L2_SHAPE_N : L1_SHAPE_N;
 
+            // Weight SF bases for this tile's two per-stage slots (see SMEM_SFB layout)
+            const float* sfb_base_0;
+            const float* sfb_base_1;
+            if (block_phase == sched::BlockPhase::Linear1) {
+                const float* base = l1_weights_sf + local_expert_idx * kL1SFPerExpert;
+                sfb_base_0        = base + n_block_idx * kL1SFKBlocks;                    // gate
+                sfb_base_1        = base + (kL1SFGateBlks + n_block_idx) * kL1SFKBlocks;  // up
+            } else {
+                // L2 pingpong: n_block_idx is in 128-col units -> covering pair (n&~1, n|1);
+                // L2 coop: n_block_idx is in 256-col units -> pair (n*2, n*2+1)
+                const float* base         = l2_weights_sf + local_expert_idx * kL2SFPerExpert;
+                const uint32_t pair_base  = kL2Pingpong ? (n_block_idx & ~1u) : n_block_idx * 2u;
+                sfb_base_0                = base + pair_base * kL2SFKBlocks;
+                sfb_base_1                = base + (pair_base + 1) * kL2SFKBlocks;
+            }
+
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 empty_barriers[stage_idx]->wait(phase ^ 1);
 
@@ -705,10 +743,16 @@ sm90_fp8_mega_moe_impl(void* y,
                     const uint32_t n_idx = local_expert_idx * shape_n + n_block_256 * BLOCK_N;
                     const uint32_t k_idx = k_block_idx * BLOCK_K;
 
-                    // TMA load B (weight SF is loaded by math warps directly from global)
+                    // TMA load B
                     tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(
                         tensor_map_b_ptr, full_barriers[stage_idx], smem_b[stage_idx],
                         k_idx, n_idx, 1);
+
+                    // Stage this k's weight SF next to the B tile (the ~200-cycle __ldg
+                    // hides inside the B TMA flight); the SAME arrive below has release
+                    // semantics and publishes these stores to the math warps' full-wait
+                    ptx::st_shared(smem_sfb[stage_idx] + 0, __ldg(sfb_base_0 + k_block_idx));
+                    ptx::st_shared(smem_sfb[stage_idx] + 1, __ldg(sfb_base_1 + k_block_idx));
 
                     full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE);
                 }
@@ -823,39 +867,15 @@ sm90_fp8_mega_moe_impl(void* y,
             float final_accum[kAccumPerThread] = {};
             float accum[kAccumPerThread];
 
-            // Block (128, 128) weight SF constants (loop-invariant).
-            // L1 SF shape (E, 2*IH/128, H/128) MN-major; the gate/up gran-8 interleave
-            // keeps a 256-wide tile inside ONE gate + ONE up SF block shared by both WGs:
-            // gate_sf_n = n_block_idx, up_sf_n = IH/128 + n_block_idx.
-            // L2 SF shape (E, H/128, IH/128) MN-major, one block per 128 output cols:
-            // pingpong tiles are 128 wide (block = n_block_idx); otherwise a 256-wide
-            // tile spans two blocks and WG g owns block n_block_idx*2 + g.
-            constexpr uint32_t kL1SFKBlocks   = kHidden / 128;
-            constexpr uint32_t kL2SFKBlocks   = kIntermediateHidden / 128;
-            constexpr uint32_t kL1SFGateBlks  = kIntermediateHidden / 128;
-            constexpr uint32_t kL1SFPerExpert = (kIntermediateHidden * 2 / 128) * kL1SFKBlocks;
-            constexpr uint32_t kL2SFPerExpert = (kHidden / 128) * kL2SFKBlocks;
-            const uint32_t l2_sf_n_block = kL2Pingpong ? n_block_idx
-                                                       : n_block_idx * 2u + epilogue_wg_idx;
-
             // B column offset into the 256-wide stage for L2: pingpong owner reads its
             // tile's half of the 256-aligned covering block; otherwise this WG's half
             const uint32_t l2_b_col_off = kL2Pingpong ? (n_block_idx & 1u) * WG_BLOCK_N * BLOCK_K
                                                       : b_col_off;
 
-            // Weight SF software pipelining: prefetch k=0 before the loop, each iteration
-            // then prefetches the next k after WGMMA (~200-cycle __ldg off the critical path)
-            float gate_sf = 0.0f, up_sf = 0.0f, l2_sf = 0.0f;
-            const float* l1_sf_base = l1_weights_sf + local_expert_idx * kL1SFPerExpert;
-            const float* l2_sf_base = l2_weights_sf + local_expert_idx * kL2SFPerExpert + l2_sf_n_block * kL2SFKBlocks;
-            if (block_phase == sched::BlockPhase::Linear1) {
-                const uint32_t gate_n = n_block_idx;
-                const uint32_t up_n   = kL1SFGateBlks + gate_n;
-                gate_sf               = __ldg(l1_sf_base + gate_n * kL1SFKBlocks + 0);
-                up_sf                 = __ldg(l1_sf_base + up_n * kL1SFKBlocks + 0);
-            } else {
-                l2_sf = __ldg(l2_sf_base + 0);
-            }
+            // This WG's weight-SF slot within the per-stage SFB pair (filled by the B
+            // loader; see SMEM_SFB layout): the pingpong owner's 128-col block is n&1
+            // within the covering pair; a coop WG g owns block n*2+g -> slot g
+            const uint32_t l2_sfb_slot = kL2Pingpong ? (n_block_idx & 1u) : epilogue_wg_idx;
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 full_barriers[stage_idx]->wait(phase);
@@ -880,9 +900,12 @@ sm90_fp8_mega_moe_impl(void* y,
                     }
                     ptx::warpgroup_commit_batch();
 
-                    // Read act SF while WGMMA is executing (overlapped with async MMA)
+                    // Read act SF + this k's weight SF (per-stage slots the B loader
+                    // filled, published by its full-barrier arrive) while WGMMA executes
                     scale_a_0_lo = ptx::ld_shared(smem_sfa[stage_idx] + sfa_row_off + r_0);
                     scale_a_1_lo = ptx::ld_shared(smem_sfa[stage_idx] + sfa_row_off + r_1);
+                    const float cur_gate_sf = ptx::ld_shared(smem_sfb[stage_idx] + 0);
+                    const float cur_up_sf   = ptx::ld_shared(smem_sfb[stage_idx] + 1);
 
 #pragma unroll
                     for (uint32_t i = 0; i < kAccumPerThread; ++i)
@@ -891,16 +914,6 @@ sm90_fp8_mega_moe_impl(void* y,
 
                     if (lane_idx == 0)
                         empty_barriers[stage_idx]->arrive();
-
-                    // Prefetch the next k-block's weight SF
-                    const float cur_gate_sf = gate_sf, cur_up_sf = up_sf;
-                    if (k_block_idx + 1 < num_k_blocks) {
-                        const uint32_t next_k = k_block_idx + 1;
-                        const uint32_t gate_n = n_block_idx;
-                        const uint32_t up_n   = kL1SFGateBlks + gate_n;
-                        gate_sf               = __ldg(l1_sf_base + gate_n * kL1SFKBlocks + next_k);
-                        up_sf                 = __ldg(l1_sf_base + up_n * kL1SFKBlocks + next_k);
-                    }
 
                     // Gate/up alternate at gran=8 along N; pre-multiply act-SF x weight-SF
                     // once per k-block so the inner element loop is pure FMA
@@ -935,9 +948,11 @@ sm90_fp8_mega_moe_impl(void* y,
                     }
                     ptx::warpgroup_commit_batch();
 
-                    // Read act SF while WGMMA is executing (single per-128 group)
+                    // Read act SF + this k's weight SF (per-stage slot the B loader
+                    // filled, published by its full-barrier arrive) while WGMMA executes
                     scale_a_0_lo = ptx::ld_shared(smem_sfa[stage_idx] + sfa_row_off + r_0);
                     scale_a_1_lo = ptx::ld_shared(smem_sfa[stage_idx] + sfa_row_off + r_1);
+                    const float cur_l2_sf = ptx::ld_shared(smem_sfb[stage_idx] + l2_sfb_slot);
 
 #pragma unroll
                     for (uint32_t i = 0; i < kAccumPerThread; ++i)
@@ -946,12 +961,6 @@ sm90_fp8_mega_moe_impl(void* y,
 
                     if (lane_idx == 0)
                         empty_barriers[stage_idx]->arrive();
-
-                    // Prefetch the next k-block's weight SF
-                    const float cur_l2_sf = l2_sf;
-                    if (k_block_idx + 1 < num_k_blocks) {
-                        l2_sf = __ldg(l2_sf_base + k_block_idx + 1);
-                    }
 
                     // Single scalar SF broadcast across N; pre-multiply once, inner loop is pure FMA
                     const float s0 = scale_a_0_lo * cur_l2_sf;

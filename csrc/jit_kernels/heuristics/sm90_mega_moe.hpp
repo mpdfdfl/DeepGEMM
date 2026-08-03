@@ -131,10 +131,11 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     // Cross-WG per-row amax exchange; must match the kernel's SMEM_AMAX_SIZE
     const int smem_amax = align(2 * block_m * static_cast<int>(sizeof(float)), kSmemAlignment);
 
-    // SFA per stage = BLOCK_M floats (one per-128 group per row); SFB is loaded
-    // directly from global by the math warpgroups, no SMEM
+    // SFA per stage = BLOCK_M floats (one per-128 group per row); SFB per stage =
+    // 2 floats (gate/up for L1, the covering block pair for L2), filled by the B
+    // loader; must match the kernel's SMEM_SFB_SIZE_PER_STAGE
     const int smem_sfa_per_stage = align(block_m * static_cast<int>(sizeof(float)), 128);
-    const int smem_sfb_per_stage = 0;
+    const int smem_sfb_per_stage = 2 * static_cast<int>(sizeof(float));
 
     // Per-stage: A tile + B tile + SFA tile + SFB tile
     const int smem_per_stage = block_m * block_k + block_n * block_k +
